@@ -182,13 +182,37 @@ cat <<'MENUEOF' > /usr/local/bin/menu
 #!/bin/bash
 # menu - SSH+WebSocket account management
 LIMIT_DIR="/etc/ws-ssh/limit"
+INFO_DIR="/etc/ws-ssh/info"
 BANLOG="/etc/ws-ssh/banned_ips.list"
-GREEN='\033[1;32m'; RED='\033[1;31m'; YELLOW='\033[1;33m'; CYAN='\033[1;36m'; NC='\033[0m'
+GREEN='[1;32m'; RED='[1;31m'; YELLOW='[1;33m'; CYAN='[1;36m'; NC='[0m'
 
-mkdir -p "$LIMIT_DIR"
+mkdir -p "$LIMIT_DIR" "$INFO_DIR"
 touch "$BANLOG"
 
 pause() { read -rp "Enter ဖိ၍ menu သို့ ပြန်သွားရန်..." _; }
+
+# Lists managed usernames with numbers (to stderr), reads a selection,
+# echoes the chosen username to stdout (so callers do: user=$(select_user)).
+select_user() {
+    mapfile -t users < <(ls "$LIMIT_DIR" 2>/dev/null | sort)
+    if [[ ${#users[@]} -eq 0 ]]; then
+        echo -e "${RED}[!] Managed user မရှိသေးပါ${NC}" >&2
+        return 1
+    fi
+    echo "User list:" >&2
+    local i=1
+    for u in "${users[@]}"; do
+        printf "  %2d) %s
+" "$i" "$u" >&2
+        ((i++))
+    done
+    read -rp "Number ရွေးပါ: " num
+    if ! [[ "$num" =~ ^[0-9]+$ ]] || (( num < 1 || num > ${#users[@]} )); then
+        echo -e "${RED}[!] မှားနေပါသည်${NC}" >&2
+        return 1
+    fi
+    echo "${users[$((num-1))]}"
+}
 
 create_user() {
     read -rp "Username: " user
@@ -206,6 +230,8 @@ create_user() {
     uid=$(id -u "$user")
     iptables -A OUTPUT -m owner --uid-owner "$uid" -m comment --comment "wsdata-$user" -j ACCEPT
     echo "$limit" > "$LIMIT_DIR/$user"
+    echo "$pass" > "$INFO_DIR/$user"
+    chmod 600 "$INFO_DIR/$user"
 
     echo -e "${GREEN}[+] User ဖန်တီးပြီးပါပြီ${NC}"
     echo "    Username : $user"
@@ -215,23 +241,19 @@ create_user() {
 }
 
 delete_user() {
-    read -rp "ဖျက်မည့် Username: " user
-    if ! id "$user" &>/dev/null; then
-        echo -e "${RED}[!] '$user' မရှိပါ${NC}"; return
-    fi
-    uid=$(id -u "$user")
+    user=$(select_user) || return
+    [[ -z "$user" ]] && return
+    uid=$(id -u "$user" 2>/dev/null)
     pkill -9 -u "$user" 2>/dev/null
-    iptables -D OUTPUT -m owner --uid-owner "$uid" -m comment --comment "wsdata-$user" -j ACCEPT 2>/dev/null
+    [[ -n "$uid" ]] && iptables -D OUTPUT -m owner --uid-owner "$uid" -m comment --comment "wsdata-$user" -j ACCEPT 2>/dev/null
     userdel -f "$user" 2>/dev/null
-    rm -f "$LIMIT_DIR/$user"
+    rm -f "$LIMIT_DIR/$user" "$INFO_DIR/$user"
     echo -e "${GREEN}[+] '$user' ကို ဖျက်ပြီးပါပြီ${NC}"
 }
 
 renew_user() {
-    read -rp "Renew မည့် Username: " user
-    if ! id "$user" &>/dev/null; then
-        echo -e "${RED}[!] '$user' မရှိပါ${NC}"; return
-    fi
+    user=$(select_user) || return
+    [[ -z "$user" ]] && return
     read -rp "ထပ်ထည့်မည့်ရက်ပေါင်း (e.g. 30): " days
     exp=$(date -d "+${days} days" +%Y-%m-%d)
     chage -E "$exp" "$user"
@@ -239,26 +261,47 @@ renew_user() {
 }
 
 check_online() {
-    printf "%-18s %-10s %-10s\n" "USERNAME" "ONLINE" "LIMIT"
+    printf "%-18s %-10s %-10s
+" "USERNAME" "ONLINE" "LIMIT"
     echo "--------------------------------------------"
     for f in "$LIMIT_DIR"/*; do
         [[ -e "$f" ]] || continue
         user=$(basename "$f")
         limit=$(cat "$f")
         online=$(ps aux | grep "sshd: $user" | grep -v grep | wc -l)
-        printf "%-18s %-10s %-10s\n" "$user" "$online" "$limit"
+        printf "%-18s %-10s %-10s
+" "$user" "$online" "$limit"
+    done
+}
+
+user_info_list() {
+    printf "%-14s %-14s %-12s %-8s
+" "USERNAME" "PASSWORD" "EXPIRE" "ONLINE"
+    echo "--------------------------------------------------------"
+    for f in "$LIMIT_DIR"/*; do
+        [[ -e "$f" ]] || continue
+        user=$(basename "$f")
+        pass=$(cat "$INFO_DIR/$user" 2>/dev/null)
+        [[ -z "$pass" ]] && pass="-"
+        exp=$(chage -l "$user" 2>/dev/null | awk -F': ' '/Account expires/ {print $2}')
+        [[ -z "$exp" ]] && exp="-"
+        online=$(ps aux | grep "sshd: $user" | grep -v grep | wc -l)
+        printf "%-14s %-14s %-12s %-8s
+" "$user" "$pass" "$exp" "$online"
     done
 }
 
 check_usage() {
-    printf "%-18s %-12s\n" "USERNAME" "USAGE(GB)"
+    printf "%-18s %-12s
+" "USERNAME" "USAGE(GB)"
     echo "----------------------------------"
     for f in "$LIMIT_DIR"/*; do
         [[ -e "$f" ]] || continue
         user=$(basename "$f")
         bytes=$(iptables -L OUTPUT -v -n -x 2>/dev/null | grep "wsdata-$user" | awk '{sum+=$2} END {print sum+0}')
         gb=$(awk -v b="$bytes" 'BEGIN { printf "%.3f", b/1024/1024/1024 }')
-        printf "%-18s %-12s\n" "$user" "$gb"
+        printf "%-18s %-12s
+" "$user" "$gb"
     done
     echo -e "${YELLOW}[note] Output (server->client) traffic ကိုသာ count ထားသည် (rough estimate)${NC}"
 }
@@ -295,24 +338,26 @@ while true; do
     echo " 1) Create User"
     echo " 2) Delete User"
     echo " 3) Renew User"
-    echo " 4) Check Online"
-    echo " 5) Check Data Usage (GB)"
-    echo " 6) Set/Check Device Limit"
-    echo " 7) Banned IP list"
-    echo " 8) Unban IP"
+    echo " 4) User Info List (username/password/expire/online)"
+    echo " 5) Check Online"
+    echo " 6) Check Data Usage (GB)"
+    echo " 7) Set/Check Device Limit"
+    echo " 8) Banned IP list"
+    echo " 9) Unban IP"
     echo " 0) Exit"
     echo -e "${CYAN}=========================================${NC}"
-    read -rp "ရွေးပါ [0-8]: " opt
+    read -rp "ရွေးပါ [0-9]: " opt
     echo
     case "$opt" in
         1) create_user ;;
         2) delete_user ;;
         3) renew_user ;;
-        4) check_online ;;
-        5) check_usage ;;
-        6) set_limit ;;
-        7) list_banned ;;
-        8) unban_ip ;;
+        4) user_info_list ;;
+        5) check_online ;;
+        6) check_usage ;;
+        7) set_limit ;;
+        8) list_banned ;;
+        9) unban_ip ;;
         0) exit 0 ;;
         *) echo -e "${RED}မှားနေပါသည်${NC}" ;;
     esac
@@ -322,6 +367,7 @@ done
 
 MENUEOF
 chmod +x /usr/local/bin/menu
+ln -sf /usr/local/bin/menu /usr/bin/menu
 
 echo -e "${YELLOW}[*] writing limiter.sh ...${NC}"
 cat <<'LIMEOF' > /usr/local/bin/limiter.sh
