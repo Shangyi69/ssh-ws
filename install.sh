@@ -3,7 +3,7 @@
 # SSH + WebSocket account-management installer
 # Creates: /usr/local/bin/ws-proxy.py (WS<->SSH forwarder)
 #          /usr/local/bin/menu        (admin menu)
-#          /usr/local/bin/limiter.sh  (device-limit + auto-ban daemon)
+#          /usr/local/bin/limiter.sh  (device-limit + expiry + auto-ban daemon)
 #--------------------------------------------------------
 set -e
 
@@ -29,7 +29,7 @@ grep -q '^AllowTcpForwarding' /etc/ssh/sshd_config || echo 'AllowTcpForwarding y
 grep -q '^PasswordAuthentication' /etc/ssh/sshd_config || echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
 systemctl restart ssh || systemctl restart sshd
 
-mkdir -p /etc/ws-ssh/limit /var/run/ws-ssh
+mkdir -p /etc/ws-ssh/limit /etc/ws-ssh/info /var/run/ws-ssh
 touch /etc/ws-ssh/banned_ips.list
 
 echo -e "${YELLOW}[*] writing ws-proxy.py ...${NC}"
@@ -184,7 +184,7 @@ cat <<'MENUEOF' > /usr/local/bin/menu
 LIMIT_DIR="/etc/ws-ssh/limit"
 INFO_DIR="/etc/ws-ssh/info"
 BANLOG="/etc/ws-ssh/banned_ips.list"
-GREEN='[1;32m'; RED='[1;31m'; YELLOW='[1;33m'; CYAN='[1;36m'; NC='[0m'
+GREEN='\033[1;32m'; RED='\033[1;31m'; YELLOW='\033[1;33m'; CYAN='\033[1;36m'; NC='\033[0m'
 
 mkdir -p "$LIMIT_DIR" "$INFO_DIR"
 touch "$BANLOG"
@@ -202,8 +202,7 @@ select_user() {
     echo "User list:" >&2
     local i=1
     for u in "${users[@]}"; do
-        printf "  %2d) %s
-" "$i" "$u" >&2
+        printf "  %2d) %s\n" "$i" "$u" >&2
         ((i++))
     done
     read -rp "Number ရွေးပါ: " num
@@ -261,22 +260,19 @@ renew_user() {
 }
 
 check_online() {
-    printf "%-18s %-10s %-10s
-" "USERNAME" "ONLINE" "LIMIT"
+    printf "%-18s %-10s %-10s\n" "USERNAME" "ONLINE" "LIMIT"
     echo "--------------------------------------------"
     for f in "$LIMIT_DIR"/*; do
         [[ -e "$f" ]] || continue
         user=$(basename "$f")
         limit=$(cat "$f")
         online=$(ps aux | grep "sshd: $user" | grep -v grep | wc -l)
-        printf "%-18s %-10s %-10s
-" "$user" "$online" "$limit"
+        printf "%-18s %-10s %-10s\n" "$user" "$online" "$limit"
     done
 }
 
 user_info_list() {
-    printf "%-14s %-14s %-12s %-8s
-" "USERNAME" "PASSWORD" "EXPIRE" "ONLINE"
+    printf "%-14s %-14s %-12s %-8s\n" "USERNAME" "PASSWORD" "EXPIRE" "ONLINE"
     echo "--------------------------------------------------------"
     for f in "$LIMIT_DIR"/*; do
         [[ -e "$f" ]] || continue
@@ -286,22 +282,19 @@ user_info_list() {
         exp=$(chage -l "$user" 2>/dev/null | awk -F': ' '/Account expires/ {print $2}')
         [[ -z "$exp" ]] && exp="-"
         online=$(ps aux | grep "sshd: $user" | grep -v grep | wc -l)
-        printf "%-14s %-14s %-12s %-8s
-" "$user" "$pass" "$exp" "$online"
+        printf "%-14s %-14s %-12s %-8s\n" "$user" "$pass" "$exp" "$online"
     done
 }
 
 check_usage() {
-    printf "%-18s %-12s
-" "USERNAME" "USAGE(GB)"
+    printf "%-18s %-12s\n" "USERNAME" "USAGE(GB)"
     echo "----------------------------------"
     for f in "$LIMIT_DIR"/*; do
         [[ -e "$f" ]] || continue
         user=$(basename "$f")
         bytes=$(iptables -L OUTPUT -v -n -x 2>/dev/null | grep "wsdata-$user" | awk '{sum+=$2} END {print sum+0}')
         gb=$(awk -v b="$bytes" 'BEGIN { printf "%.3f", b/1024/1024/1024 }')
-        printf "%-18s %-12s
-" "$user" "$gb"
+        printf "%-18s %-12s\n" "$user" "$gb"
     done
     echo -e "${YELLOW}[note] Output (server->client) traffic ကိုသာ count ထားသည် (rough estimate)${NC}"
 }
@@ -400,6 +393,25 @@ ban_ip() {
     fi
 }
 
+kill_expired() {
+    [[ -d "$LIMIT_DIR" ]] || return
+    local now
+    now=$(date +%s)
+    for f in "$LIMIT_DIR"/*; do
+        [[ -e "$f" ]] || continue
+        local user exp_str exp_epoch
+        user=$(basename "$f")
+        exp_str=$(chage -l "$user" 2>/dev/null | awk -F': ' '/Account expires/ {print $2}')
+        [[ -z "$exp_str" || "$exp_str" == "never" ]] && continue
+        exp_epoch=$(date -d "$exp_str" +%s 2>/dev/null) || continue
+        if (( exp_epoch <= now )); then
+            if pkill -9 -u "$user" 2>/dev/null; then
+                logger -t ws-ssh-limiter "user=$user expired ($exp_str) -> disconnected"
+            fi
+        fi
+    done
+}
+
 one_pass() {
     [[ -d "$LIMIT_DIR" ]] || return
     [[ -f "$STATE_FILE" ]] || return
@@ -449,6 +461,7 @@ one_pass() {
 }
 
 while true; do
+    kill_expired
     one_pass
     sleep "$POLL_SECONDS"
 done
@@ -475,7 +488,7 @@ EOF
 
 cat <<'EOF' > /etc/systemd/system/ws-limiter.service
 [Unit]
-Description=SSH-WS per-user device limiter / auto-ban
+Description=SSH-WS per-user device limiter / expiry enforcer / auto-ban
 After=network.target
 
 [Service]
