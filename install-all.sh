@@ -1,116 +1,40 @@
 #!/bin/bash
 #--------------------------------------------------------
-# SSH + WebSocket account-management installer
-# Creates: /usr/local/bin/ws-proxy.py (WS<->SSH forwarder)
-#          /usr/local/bin/menu        (admin menu)
-#          /usr/local/bin/limiter.sh  (device-limit + expiry + auto-ban daemon)
+# 1-click installer: core SSH+WS system + Web panel
 #--------------------------------------------------------
 set -e
-
 RED='\033[1;31m'; GREEN='\033[1;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
 [[ "$EUID" -ne 0 ]] && { echo -e "${RED}[x] root user နဲ့ run ပါ${NC}"; exit 1; }
 
-if [[ -n "$1" ]]; then
-    WS_PORT="$1"
-else
-    read -rp "WebSocket port ဘယ်ဟာသုံးမလဲ (e.g. 8880): " WS_PORT
+REPO="raw.githubusercontent.com/Shangyi69/ssh-ws/main"
+
+WS_PORT="${1:-}"
+PANEL_PORT="${2:-}"
+
+if [[ -z "$WS_PORT" ]]; then
+    read -rp "WebSocket port ဘယ်ဟာသုံးမလဲ (e.g. 80): " WS_PORT
 fi
-[[ -z "$WS_PORT" ]] && { echo -e "${RED}[x] port ထည့်ပါ${NC}"; exit 1; }
+[[ -z "$WS_PORT" ]] && WS_PORT=80
 
-echo -e "${YELLOW}[*] Package update / install...${NC}"
-apt update -y
-apt install -y openssh-server python3 iptables jq net-tools iproute2 cron >/dev/null
+if [[ -z "$PANEL_PORT" ]]; then
+    read -rp "Web panel port (default 2053, Enter ဖိရင် default): " PANEL_PORT
+fi
+[[ -z "$PANEL_PORT" ]] && PANEL_PORT=2053
 
-echo -e "${YELLOW}[*] sshd config...${NC}"
-sed -i 's/^#\?AllowTcpForwarding.*/AllowTcpForwarding yes/' /etc/ssh/sshd_config
-sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-grep -q '^AllowTcpForwarding' /etc/ssh/sshd_config || echo 'AllowTcpForwarding yes' >> /etc/ssh/sshd_config
-grep -q '^PasswordAuthentication' /etc/ssh/sshd_config || echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
-systemctl restart ssh || systemctl restart sshd
+echo -e "${YELLOW}[1/2] Core SSH+WS system install (port ${WS_PORT})...${NC}"
+bash <(wget -qO- "${REPO}/install.sh") "$WS_PORT"
 
-mkdir -p /etc/ws-ssh/limit /etc/ws-ssh/info /var/run/ws-ssh
-touch /etc/ws-ssh/banned_ips.list
+echo -e "${YELLOW}[2/2] Web panel install (port ${PANEL_PORT})...${NC}"
+bash <(wget -qO- "${REPO}/install-panel.sh") "$PANEL_PORT"
 
-echo -e "${YELLOW}[*] writing ws-proxy.py ...${NC}"
-cat <<'PYEOF' > /usr/local/bin/ws-proxy.py
-#!/usr/bin/env python3
-"""
-ws-proxy.py
-SSH-over-WebSocket forwarder.
-Listens on WS_PORT, does a minimal HTTP/WebSocket handshake (accepts any
-request, answers 101), then bridges raw bytes to 127.0.0.1:SSH_PORT.
+IP=$(curl -s -4 ifconfig.me || hostname -I | awk '{print $1}')
 
-While a connection is active it records {local_ephemeral_port: {ip, ts}}
-into STATE_FILE so that limiter.sh can later match an established
-sshd<->127.0.0.1 session (seen via `ss -tnp`) back to the real client IP.
-"""
-
-import asyncio
-import json
-import os
-import sys
-import time
-
-WS_PORT = int(os.environ.get("WS_PORT", "8880"))
-SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
-STATE_FILE = "/var/run/ws-ssh/active_conns.json"
-
-_lock = asyncio.Lock()
-
-
-async def _load_state():
-    try:
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-async def _save_state(state):
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f)
-    os.replace(tmp, STATE_FILE)
-
-
-async def _register(port, ip):
-    async with _lock:
-        state = await _load_state()
-        state[str(port)] = {"ip": ip, "ts": time.time()}
-        await _save_state(state)
-
-
-async def _unregister(port):
-    async with _lock:
-        state = await _load_state()
-        state.pop(str(port), None)
-        await _save_state(state)
-
-
-async def _relay(reader, writer):
-    try:
-        while True:
-            data = await reader.read(65536)
-            if not data:
-                break
-            writer.write(data)
-            await writer.drain()
-    except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
-        pass
-    finally:
-        try:
-            writer.close()
-        except Exception:
-            pass
-
-
-async def handle_client(client_reader, client_writer):
-    peer = client_writer.get_extra_info("peername")
-    client_ip = peer[0] if peer else "unknown"
-
-    # --- minimal WS handshake: accept any initial HTTP request, answer 101.
-    # If the first bytes don't look like an HTTP request, treat them as
+echo -e "${GREEN}=========================================${NC}"
+echo -e "${GREEN}  စနစ်တစ်ခုလုံးကို အောင်မြင်စွာ တပ်ဆင်ပြီးပါပြီ။${NC}"
+echo -e "${GREEN}  WebSocket Port: $WS_PORT${NC}"
+echo -e "${GREEN}  Web Panel URL : http://$IP:$PANEL_PORT${NC}"
+echo -e "${GREEN}=========================================${NC}"
     # already being SSH traffic and just forward them through untouched.
     try:
         first = await asyncio.wait_for(client_reader.read(4096), timeout=5)
