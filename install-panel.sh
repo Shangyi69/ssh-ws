@@ -226,7 +226,16 @@ def logout():
 @app.route("/")
 @login_required
 def dashboard():
-    return render_template("dashboard.html", users=list_users(), panel_user=load_auth()["username"])
+    users = list_users()
+    stats = {
+        "total": len(users),
+        "online": sum(1 for u in users if u["online"] > 0),
+        "ended": sum(1 for u in users if u["expired"]),
+    }
+    stats["active"] = stats["total"] - stats["ended"]
+    return render_template(
+        "dashboard.html", users=users, stats=stats, panel_user=load_auth()["username"]
+    )
 
 
 @app.route("/api/create", methods=["POST"])
@@ -439,6 +448,7 @@ cat <<'LOGINEOF' > /opt/ws-panel/templates/login.html
   }
   button:hover{filter:brightness(1.08);}
   .err{color:var(--danger); font-size:13px; margin-top:14px; text-align:center;}
+  .credit{color:var(--muted); font-size:11px; text-align:center; margin-top:18px; letter-spacing:.3px;}
 </style>
 </head>
 <body>
@@ -451,6 +461,7 @@ cat <<'LOGINEOF' > /opt/ws-panel/templates/login.html
     <input name="password" type="password" autocomplete="current-password" required>
     <button type="submit">ဝင်မည်</button>
     {% if error %}<div class="err">{{ error }}</div>{% endif %}
+    <div class="credit">Dev Phoe Shan</div>
   </form>
 </body>
 </html>
@@ -466,8 +477,8 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
 <title>SSH-WS Panel</title>
 <style>
   :root{
-    --bg:#0f1115; --card:#171a21; --border:#262b35; --row:#1b1f28;
-    --text:#e7e9ee; --muted:#8b93a3; --accent:#4f8cff; --green:#33c481;
+    --bg:#0c0e13; --card:#151821; --card2:#11141b; --border:#252a36; --row:#1a1e28;
+    --text:#e9ebf1; --muted:#8a91a3; --accent:#4f8cff; --green:#2ecf81;
     --red:#ef4f5f; --yellow:#e2b93b;
   }
   *{box-sizing:border-box;}
@@ -477,14 +488,40 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
   }
   header{
     display:flex; align-items:center; justify-content:space-between;
-    padding:16px 22px; border-bottom:1px solid var(--border); position:sticky; top:0;
+    padding:14px 22px; border-bottom:1px solid var(--border); position:sticky; top:0;
     background:var(--bg); z-index:5;
   }
-  header h1{font-size:18px; margin:0;}
+  header h1{font-size:17px; margin:0; letter-spacing:.2px;}
   header .right{display:flex; gap:10px; align-items:center;}
   .muted{color:var(--muted); font-size:13px;}
-  main{padding:20px 22px 60px;}
-  .toolbar{display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; flex-wrap:wrap; gap:10px;}
+  main{padding:18px 18px 60px; max-width:1280px; margin:0 auto;}
+
+  /* ── stat cards ─────────────────────────────────────────────────── */
+  .stats{
+    display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:16px;
+  }
+  .stat{
+    background:var(--card); border:1px solid var(--border); border-radius:10px;
+    padding:13px 16px;
+  }
+  .stat .n{font-size:22px; font-weight:700; display:flex; align-items:center; gap:7px;}
+  .stat .l{color:var(--muted); font-size:12px; margin-top:3px;}
+  .stat .dot{width:8px; height:8px; border-radius:50%; flex:none;}
+  .stat.online .dot{background:var(--green);}
+  .stat.ended .n{color:var(--red);}
+  .stat.active .n{color:var(--green);}
+
+  .toolbar{display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:10px;}
+  .search{
+    flex:1; min-width:180px; max-width:340px; display:flex; align-items:center; gap:8px;
+    background:var(--card); border:1px solid var(--border); border-radius:8px; padding:0 12px;
+  }
+  .search svg{flex:none; opacity:.5;}
+  .search input{
+    border:none; background:none; color:var(--text); font-size:13px; padding:9px 0;
+    width:100%; outline:none;
+  }
+
   .btn{
     border:none; border-radius:8px; padding:9px 14px; font-size:13px; font-weight:600;
     cursor:pointer; color:#fff; background:var(--accent);
@@ -494,36 +531,42 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
   .btn.ghost{background:transparent; border:1px solid var(--border); color:var(--text);}
   .btn:hover{filter:brightness(1.1);}
   .btn.small{padding:6px 10px; font-size:12px;}
-  table{width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--border); border-radius:12px; overflow:hidden;}
-  thead th{
-    text-align:left; font-size:12px; color:var(--muted); text-transform:uppercase;
-    padding:12px 14px; border-bottom:1px solid var(--border);
+
+  /* ── table: real table at all sizes, horizontal-scroll on mobile ──── */
+  .tablewrap{
+    border:1px solid var(--border); border-radius:12px; overflow-x:auto;
+    background:var(--card); -webkit-overflow-scrolling:touch;
   }
-  tbody td{padding:12px 14px; font-size:14px; border-bottom:1px solid var(--border); vertical-align:middle;}
+  table{width:100%; border-collapse:collapse; min-width:760px;}
+  thead th{
+    text-align:left; font-size:11px; color:var(--muted); text-transform:uppercase;
+    letter-spacing:.4px; padding:11px 14px; border-bottom:1px solid var(--border);
+    white-space:nowrap; position:sticky; top:0; background:var(--card);
+  }
+  tbody td{padding:11px 14px; font-size:13.5px; border-bottom:1px solid var(--border); vertical-align:middle; white-space:nowrap;}
   tbody tr:last-child td{border-bottom:none;}
   tbody tr:hover{background:var(--row);}
-  .pw{font-family:monospace; cursor:pointer;}
-  .badge{padding:3px 9px; border-radius:999px; font-size:12px; font-weight:600;}
-  .badge.on{background:rgba(51,196,129,.15); color:var(--green);}
-  .badge.off{background:rgba(139,147,163,.15); color:var(--muted);}
+  .uname{font-weight:600;}
+  .pw{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; cursor:pointer; color:var(--muted);}
+  .pw:hover{color:var(--text);}
+  .status{display:inline-flex; align-items:center; gap:6px; font-size:12.5px; font-weight:600;}
+  .status .dot{width:7px; height:7px; border-radius:50%; flex:none;}
+  .status.on{color:var(--green);} .status.on .dot{background:var(--green);}
+  .status.off{color:var(--muted);} .status.off .dot{background:var(--muted);}
+  .badge{padding:3px 9px; border-radius:999px; font-size:11.5px; font-weight:600; white-space:nowrap;}
   .badge.expired{background:rgba(239,79,95,.15); color:var(--red);}
-  tr.expired-row{background:rgba(239,79,95,.10);}
-  tr.expired-row:hover{background:rgba(239,79,95,.16);}
-  tr.expired-row td:first-child b{color:var(--red);}
-  .actions{display:flex; gap:6px; flex-wrap:wrap;}
+  tr.expired-row{background:rgba(239,79,95,.07);}
+  tr.expired-row:hover{background:rgba(239,79,95,.13);}
+  tr.expired-row .uname{color:var(--red);}
+  .actions{display:flex; gap:6px;}
   .card{background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px; margin-top:24px;}
   .card h2{font-size:15px; margin:0 0 12px;}
-  .iplist{display:flex; gap:8px; flex-wrap:wrap;}
-  .ipchip{
-    background:#0f1115; border:1px solid var(--border); border-radius:999px;
-    padding:6px 10px 6px 14px; font-size:13px; display:flex; gap:8px; align-items:center;
-  }
-  .ipchip button{background:none; border:none; color:var(--red); cursor:pointer; font-size:13px;}
   .ipbadge{
     display:inline-block; background:rgba(79,140,255,.12); color:var(--accent);
     border:1px solid rgba(79,140,255,.25); border-radius:6px;
     padding:2px 7px; font-size:11px; font-family:monospace; margin:1px;
   }
+  .empty{padding:40px 14px; text-align:center; color:var(--muted); font-size:13px;}
 
   /* modal */
   .overlay{
@@ -546,13 +589,11 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
   .msg{font-size:13px; margin-top:10px; min-height:16px;}
   .msg.err{color:var(--red);}
   .msg.ok{color:var(--green);}
+  .credit{color:var(--muted); font-size:11px; text-align:center; margin-top:22px; letter-spacing:.3px;}
   @media (max-width:720px){
-    table{display:block; border:none; background:none;}
-    thead{display:none;}
-    tbody{display:block;}
-    tbody tr{display:block; background:var(--card); border:1px solid var(--border); border-radius:12px; margin-bottom:10px;}
-    tbody td{display:flex; justify-content:space-between; border-bottom:none; padding:8px 14px;}
-    tbody td::before{content:attr(data-label); color:var(--muted); font-size:12px;}
+    main{padding:14px 12px 50px;}
+    .stats{grid-template-columns:repeat(2,1fr);}
+    table{min-width:680px;}
   }
 </style>
 </head>
@@ -567,11 +608,34 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
   </header>
 
   <main>
+    <div class="stats">
+      <div class="stat total">
+        <div class="n">{{ stats.total }}</div>
+        <div class="l">အသုံးပြုသူ စုစုပေါင်း</div>
+      </div>
+      <div class="stat online">
+        <div class="n"><span class="dot"></span>{{ stats.online }}</div>
+        <div class="l">အွန်လိုင်း</div>
+      </div>
+      <div class="stat active">
+        <div class="n">{{ stats.active }}</div>
+        <div class="l">သက်တမ်းရှိ</div>
+      </div>
+      <div class="stat ended">
+        <div class="n">{{ stats.ended }}</div>
+        <div class="l">သက်တမ်းကုန်</div>
+      </div>
+    </div>
+
     <div class="toolbar">
-      <div class="muted">စုစုပေါင်းအသုံးပြုသူ: {{ users|length }}</div>
+      <div class="search">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+        <input id="searchBox" placeholder="အသုံးပြုသူအမည် ရှာရန်..." oninput="filterRows()">
+      </div>
       <button class="btn green" onclick="openModal('createModal')">+ အသုံးပြုသူဖန်တီးမည်</button>
     </div>
 
+    <div class="tablewrap">
     <table>
       <thead>
         <tr>
@@ -581,21 +645,21 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
       </thead>
       <tbody id="userRows">
         {% for u in users %}
-        <tr data-user="{{ u.username }}"{% if u.expired %} class="expired-row"{% endif %}>
-          <td data-label="အသုံးပြုသူအမည်"><b>{{ u.username }}</b></td>
-          <td data-label="စကားဝှက်"><span class="pw" title="click to copy" onclick="copyText('{{ u.password }}')">{{ u.password }}</span></td>
-          <td data-label="သက်တမ်းကုန်ဆုံး">
+        <tr data-user="{{ u.username|lower }}"{% if u.expired %} class="expired-row"{% endif %}>
+          <td class="uname">{{ u.username }}</td>
+          <td><span class="pw" title="click to copy" onclick="copyText('{{ u.password }}')">{{ u.password }}</span></td>
+          <td>
             {% if u.expired %}
-              <span class="badge expired">{{ u.expire }} [EXPIRED]</span>
+              <span class="badge expired">{{ u.expire }} · EXPIRED</span>
             {% else %}
               {{ u.expire }}
             {% endif %}
           </td>
-          <td data-label="ကန့်သတ်ချက်">{{ u.limit }}</td>
-          <td data-label="အွန်လိုင်း">
-            <span class="badge {{ 'on' if u.online > 0 else 'off' }}">{{ u.online }}</span>
+          <td>{{ u.limit }}</td>
+          <td>
+            <span class="status {{ 'on' if u.online > 0 else 'off' }}"><span class="dot"></span>{{ u.online }}</span>
           </td>
-          <td data-label="IP စာရင်း">
+          <td>
             {% if u.online_ips %}
               {% for ip in u.online_ips %}
                 <span class="ipbadge">{{ ip }}</span>
@@ -604,8 +668,8 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
               <span class="muted">-</span>
             {% endif %}
           </td>
-          <td data-label="အသုံးပြုမှု">{{ u.usage_gb }}</td>
-          <td data-label="လုပ်ဆောင်ချက်များ">
+          <td>{{ u.usage_gb }}</td>
+          <td>
             <div class="actions">
               <button class="btn small" onclick="openRenew('{{ u.username }}')">သက်တမ်းတိုးမည်</button>
               <button class="btn ghost small" onclick="openLimit('{{ u.username }}','{{ u.limit }}')">ကန့်သတ်မည်</button>
@@ -617,6 +681,10 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
         {% endfor %}
       </tbody>
     </table>
+    </div>
+    <div id="emptyMsg" class="empty" style="display:none;">ရှာဖွေမှုနှင့် ကိုက်ညီသော အသုံးပြုသူ မတွေ့ပါ</div>
+
+    <div class="credit">Dev Phoe Shan</div>
 
     </main>
 
@@ -684,6 +752,18 @@ function closeModal(id){ document.getElementById(id).classList.remove('show'); }
 
 function copyText(t){
   navigator.clipboard && navigator.clipboard.writeText(t);
+}
+
+function filterRows(){
+  const q = document.getElementById('searchBox').value.trim().toLowerCase();
+  const rows = document.querySelectorAll('#userRows tr');
+  let visible = 0;
+  rows.forEach(r => {
+    const match = r.dataset.user.includes(q);
+    r.style.display = match ? '' : 'none';
+    if(match) visible++;
+  });
+  document.getElementById('emptyMsg').style.display = (visible === 0) ? 'block' : 'none';
 }
 
 async function api(url, body){
