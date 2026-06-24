@@ -1,49 +1,158 @@
-# SSH + WebSocket Account Manager
+# SSH-WS — SSH over WebSocket + Web Panel
 
-## Install (VPS ပေါ်မှာ root နဲ့ run ပါ)
+A lightweight SSH-over-WebSocket tunneling service for Linux, with per-user
+device limits, account expiry, and a web dashboard for day-to-day account
+management.
 
-```bash
-chmod +x install.sh
-./install.sh 8880
-```
-(`8880` ကို မိမိချိတ်ဆက်ချင်တဲ့ custom port နဲ့ အလိုအလျောက် ပြောင်းပါ။ run ရင် port မထည့်ထားရင် prompt က မေးပါမယ်)
+**Dev: Phoe Shan**
 
-Install ပြီးရင်:
-- SSH ကို port 22 အတွင်းပိုင်းမှာ ဆက်ထားပြီး `ws-proxy.py` က သင်ရွေးထားတဲ့ port ပေါ်မှာ WebSocket handshake ခံပြီး SSH traffic ကို forward ပေးပါတယ်။ Client app (HTTP Injector/NPV/KPN Tunnel စသည်) ထဲမှာ SSH Host=server IP, SSH Port=22, Payload/WS Port=ရွေးထားတဲ့ custom port နဲ့ setup လုပ်ပါ။
-- `ws-proxy.service` နဲ့ `ws-limiter.service` ဆိုတဲ့ systemd service နှစ်ခု run နေပါမယ် (boot တိုင်း auto-start)။
+---
 
-## Daily use
+## What's included
 
-```bash
-menu
-```
+| File | Purpose |
+|---|---|
+| `install.sh` | Installs the WebSocket→SSH proxy (`ws-proxy.py`), the CLI account manager (`menu`), and the device-limit/expiry enforcer daemon (`limiter.sh`). |
+| `install-panel.sh` | Installs the web dashboard (Flask app + systemd service) for managing accounts from a browser. |
+| `install-all.sh` | One-shot wrapper that runs both installers back to back. |
 
-Menu ထဲမှာ:
-1. Create User – username/password/သက်တမ်း/device limit ထည့်
-2. Delete User
-3. Renew User – သက်တမ်းတိုး
-4. Check Online – user တစ်ယောက်စီ ဘယ်နှစ်ချိတ်ဆက်နေလဲ
-5. Check Data Usage (GB) – user တစ်ယောက်စီ data သုံးထားတာ
-6. Set/Check Device Limit
-7/8. Banned IP list / Unban
+All three are plain bash scripts — no Docker, no extra package manager beyond
+what's already on a standard Debian/Ubuntu server.
 
-## Device limit + auto-ban ဘယ်လိုအလုပ်လုပ်လဲ
+---
 
-- User account create တုန်းက limit (e.g. `1`) ထည့်ထားရင်, `ws-limiter.service` က 5 စက္ကန့်တစ်ခါ active session တွေကို scan လုပ်ပါတယ်။
-- Limit ထက်ပိုပြီး ချိတ်ဆက်လာရင် (ဥပမာ device 2 ခုချိတ်ရင်) **အသစ်ဆုံးချိတ်ဆက်မှု**ကို kill လုပ်ပြီး ၄င်း device ရဲ့ real IP ကို `iptables DROP` နဲ့ ban လုပ်ပါတယ် (ပထမဆုံးချိတ်ထားတဲ့ device ကို မထိခိုက်ပါ)။
-- Banned IP စာရင်းကို `/etc/ws-ssh/banned_ips.list` မှာ သိမ်းထားပြီး `menu` အောက်က option 8 နဲ့ unban လုပ်နိုင်ပါတယ်။
+## Requirements
 
-## သိထားရမှာများ (limitations)
+- A Debian/Ubuntu VPS with root access
+- `sshd` already installed and running on port 22
+- Python 3 (for the proxy and the web panel)
+- Outbound internet access to download the scripts
 
-- **Data usage (GB)** ကို `iptables owner` module နဲ့ user ရဲ့ **OUTPUT (server→client) traffic** ကိုသာ count ထားတာဖြစ်ပြီး, download+upload နှစ်ခုကို အတိအကျ ခွဲမတိုင်းတာနိုင်ပါ (နှစ်ဖက်စလုံး အတိအကျ လိုချင်ရင် `cgroup net_cls` based accounting လိုအပ်ပါမယ် — ပိုပြီး setup ရှုပ်ထွေးပါမယ်)။
-- WebSocket handshake က "any request → 101" ဆိုတဲ့ ရိုးရှင်းတဲ့ fake-WS style ဖြစ်ပြီး, payload/header validation မလုပ်ပါ (client app အများစုနဲ့ အလုပ်လုပ်ပါမယ်)။
-- Real client IP tracking က `ws-proxy.py` ရေးထားတဲ့ `/var/run/ws-ssh/active_conns.json` ကို sshd session (`ss -tnp`) နဲ့ port-correlate လုပ်ပြီး ရှာတာဖြစ်ပါတယ် — service ၂ခုလုံး run နေမှ အလုပ်လုပ်ပါမယ်။
-- Firewall (ufw) active ထားရင် install script က ရွေးထားတဲ့ port ကို auto allow လုပ်ပေးပါတယ်; cloud provider ရဲ့ Security Group/Firewall ပေါ်မှာတော့ ကိုယ်တိုင် port ဖွင့်ပေးရပါမယ်။
+---
 
-## Service status / log
+## Installation
+
+### Option A — One-shot install (recommended)
 
 ```bash
-systemctl status ws-proxy
-systemctl status ws-limiter
-journalctl -u ws-limiter -f
+bash <(wget -qO- raw.githubusercontent.com/Shangyi69/ssh-ws/main/install-all.sh) <WS_PORT> <PANEL_PORT>
 ```
+
+Example — WebSocket service on port `80`, web panel on port `2053`:
+
+```bash
+bash <(wget -qO- raw.githubusercontent.com/Shangyi69/ssh-ws/main/install-all.sh) 80 2053
+```
+
+### Option B — Install each part separately
+
+```bash
+# 1. SSH-WS service (replace 80 with whatever port you want clients to connect to)
+bash <(wget -qO- raw.githubusercontent.com/Shangyi69/ssh-ws/main/install.sh) 80
+
+# 2. Web panel (replace 2053 with whatever port you want the dashboard on)
+bash <(wget -qO- raw.githubusercontent.com/Shangyi69/ssh-ws/main/install-panel.sh) 2053
+```
+
+If you omit the port argument, each script will either prompt you for it
+(`install.sh`) or fall back to a default of `2053` (`install-panel.sh`).
+
+After installation, all services run under `systemd` and restart
+automatically on reboot or crash:
+
+```bash
+systemctl status ws-proxy.service
+systemctl status ws-limiter.service
+systemctl status ws-panel.service
+```
+
+---
+
+## CLI account management (`menu`)
+
+Run `menu` from any shell on the server to open the interactive account
+manager (menu text is in Burmese):
+
+```
+1) Create User
+2) Delete User
+3) Renew User
+4) User Info List
+5) Check Online + IP List
+6) Check Data Usage (GB)
+7) Set/Check Device Limit
+8) Kick User (force disconnect all sessions)
+0) Exit
+```
+
+- **Create User** — sets a username, password, expiry date, and device limit.
+- **Renew User** — extends the expiry date *and* clears any leftover PAM
+  login lockout / password lock from the account's expired period, so the
+  user can reconnect immediately.
+- **Kick User** — force-disconnects every active session for that user.
+
+---
+
+## Web Panel
+
+Open `http://<server-ip>:<PANEL_PORT>` in a browser and log in with the
+admin credentials created during install (shown at the end of the
+`install-panel.sh` output).
+
+### Dashboard
+
+- **Summary cards** — total users, currently online, active (not expired),
+  and expired ("Ended") counts at a glance.
+- **Search bar** — filter the user table by username instantly.
+- **User table** — username, password (click to copy), expiry date, device
+  limit, online count, connected IPs, data usage, and per-user actions:
+  - **Renew** — extend expiry (also clears PAM lockouts, same as the CLI).
+  - **Limit** — change the device limit.
+  - **Kick** — force-disconnect all of that user's sessions.
+  - **Delete** — remove the account entirely.
+- Expired users are highlighted in red with an `EXPIRED` badge.
+
+### Automatic device-limit enforcement
+
+A background thread inside the panel checks every user's online session
+count against their configured device limit every few seconds. If a user
+exceeds their limit, the panel automatically performs the same action as
+clicking **Kick** — no manual intervention needed. This runs for as long as
+the panel service is active (24/7, restarted automatically by `systemd`).
+
+### Account settings
+
+- **Change Password** — change the panel admin's own login username/password
+  from the dashboard.
+
+---
+
+## Notes on device limits and expiry
+
+- Device-limit enforcement and the panel's auto-kick run independently and
+  use the exact same underlying action (`pkill -9 -u <user>`), so behavior
+  is consistent whether triggered automatically or by clicking a button.
+- Renewing an expired account clears both:
+  - the `chage` account-expiry date, and
+  - any PAM failed-login lockout / password lock (`!` prefix in
+    `/etc/shadow`) left over from the expired period.
+
+  If an account was locked *before* this fix was applied, unlock it once
+  manually:
+
+  ```bash
+  passwd -u <username>
+  ```
+
+---
+
+## Uninstalling
+
+```bash
+systemctl disable --now ws-proxy.service ws-limiter.service ws-panel.service
+rm -f /usr/local/bin/menu /usr/local/bin/limiter.sh
+rm -rf /opt/ws-proxy /opt/ws-panel /etc/ws-ssh
+```
+
+(Existing Linux user accounts created via `menu` are not removed
+automatically — delete them with `userdel -r <username>` if needed.)
