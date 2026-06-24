@@ -14,7 +14,7 @@ PANEL_PORT="${1:-2053}"
 echo -e "${YELLOW}[*] Package install...${NC}"
 apt update -y
 apt install -y python3 python3-pip >/dev/null
-pip install --break-system-packages -q flask werkzeug
+pip3 install -q flask werkzeug --break-system-packages 2>/dev/null || pip3 install -q flask werkzeug
 
 mkdir -p /opt/ws-panel/templates /etc/ws-ssh/panel /etc/ws-ssh/limit /etc/ws-ssh/info
 touch /etc/ws-ssh/banned_ips.list
