@@ -413,116 +413,41 @@ kill_expired() {
         fi
     done
 }
+#!/bin/bash
+#--------------------------------------------------------
+# 1-click installer: core SSH+WS system + Web panel
+#--------------------------------------------------------
+set -e
+RED='\033[1;31m'; GREEN='\033[1;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
-one_pass() {
-    [[ -d "$LIMIT_DIR" ]] || return
-    [[ -f "$STATE_FILE" ]] || return
+[[ "$EUID" -ne 0 ]] && { echo -e "${RED}[x] root user နဲ့ run ပါ${NC}"; exit 1; }
 
-    # username -> "port:pid:ts:ip" lines
-    declare -A sessions
+REPO="raw.githubusercontent.com/Shangyi69/ssh-ws/main"
 
-    while read -r line; do
-        # ss -H -tnp output, established conns where local port is 22
-        local_addr=$(awk '{print $4}' <<< "$line")
-        peer_addr=$(awk '{print $5}' <<< "$line")
-        [[ "$local_addr" != *:22 ]] && continue
+WS_PORT="${1:-}"
+PANEL_PORT="${2:-}"
 
-        peer_port="${peer_addr##*:}"
-        pid=$(grep -oP 'pid=\K[0-9]+' <<< "$line")
-        [[ -z "$pid" ]] && continue
-
-        user=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
-        [[ -z "$user" ]] && continue
-        [[ -f "$LIMIT_DIR/$user" ]] || continue
-
-        ip=$(jq -r --arg p "$peer_port" '.[$p].ip // "unknown"' "$STATE_FILE" 2>/dev/null)
-        ts=$(jq -r --arg p "$peer_port" '.[$p].ts // 0' "$STATE_FILE" 2>/dev/null)
-
-        # ပြင်ဆင်ချက် - IP မသိရလျှင် ss ထဲမှ Peer IP လိပ်စာကို တိုက်ရိုက်ရယူရန်
-        if [[ "$ip" == "unknown" || -z "$ip" ]]; then
-            ip="${peer_addr%:*}"
-        fi
-
-        sessions["$user"]+="$pid:$ts:$ip"$'\n'
-    done < <(ss -H -tnp state established '( sport = :22 )' 2>/dev/null)
-
-    for user in "${!sessions[@]}"; do
-        limit=$(cat "$LIMIT_DIR/$user" 2>/dev/null)
-        [[ -z "$limit" ]] && continue
-
-        # sort this user's sessions oldest-first, keep $limit, kill the rest
-        mapfile -t lines < <(echo -n "${sessions[$user]}" | sort -t: -k2 -n)
-        count=${#lines[@]}
-        [[ "$count" -le "$limit" ]] && continue
-
-        excess=$(( count - limit ))
-        for ((i = count - excess; i < count; i++)); do
-            entry="${lines[$i]}"
-            pid="${entry%%:*}"
-            
-            # ပြင်ဆင်ချက် - Format အလိုက် တကယ့် client IP အမှန်ကို သေချာစွာ ရယူခြင်း
-            rest="${entry#*:}"
-            ip="${rest#*:}"
-            
-            kill -9 "$pid" 2>/dev/null
-            if [[ -n "$ip" && "$ip" != "unknown" && "$ip" != "127.0.0.1" ]]; then
-                ban_ip "$ip"
-            fi
-            logger -t ws-ssh-limiter "user=$user limit=$limit exceeded -> killed pid=$pid ip=$ip"
-        done
-    done
-}
-
-while true; do
-    kill_expired
-    one_pass
-    sleep "$POLL_SECONDS"
-done
-
-LIMEOF
-chmod +x /usr/local/bin/limiter.sh
-
-echo -e "${YELLOW}[*] systemd services ...${NC}"
-cat <<EOF > /etc/systemd/system/ws-proxy.service
-[Unit]
-Description=SSH over WebSocket proxy
-After=network.target ssh.service
-
-[Service]
-Environment=WS_PORT=${WS_PORT}
-Environment=SSH_PORT=22
-ExecStart=/usr/bin/python3 /usr/local/bin/ws-proxy.py
-Restart=always
-RuntimeDirectory=ws-ssh
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat <<'EOF' > /etc/systemd/system/ws-limiter.service
-[Unit]
-Description=SSH-WS per-user device limiter / expiry enforcer / auto-ban
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/limiter.sh
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now ws-proxy.service
-systemctl enable --now ws-limiter.service
-
-# allow the chosen port through ufw if it's active
-if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
-    ufw allow "${WS_PORT}"/tcp
+if [[ -z "$WS_PORT" ]]; then
+    read -rp "WebSocket port ဘယ်ဟာသုံးမလဲ (e.g. 80): " WS_PORT
 fi
+[[ -z "$WS_PORT" ]] && WS_PORT=80
+
+if [[ -z "$PANEL_PORT" ]]; then
+    read -rp "Web panel port (default 2053, Enter ဖိရင် default): " PANEL_PORT
+fi
+[[ -z "$PANEL_PORT" ]] && PANEL_PORT=2053
+
+echo -e "${YELLOW}[1/2] Core SSH+WS system install (port ${WS_PORT})...${NC}"
+bash <(wget -qO- "${REPO}/install.sh") "$WS_PORT"
+
+echo -e "${YELLOW}[2/2] Web panel install (port ${PANEL_PORT})...${NC}"
+bash <(wget -qO- "${REPO}/install-panel.sh") "$PANEL_PORT"
+
+IP=$(curl -s -4 ifconfig.me || hostname -I | awk '{print $1}')
 
 echo -e "${GREEN}=========================================${NC}"
-echo -e "${GREEN}  Install ပြီးပါပြီ!${NC}"
-echo -e "${GREEN}  WebSocket port : ${WS_PORT}${NC}"
-echo -e "${GREEN}  Menu command   : menu${NC}"
+echo -e "${GREEN}  စနစ်တစ်ခုလုံးကို အောင်မြင်စွာ တပ်ဆင်ပြီးပါပြီ။${NC}"
+echo -e "${GREEN}  WebSocket Port: $WS_PORT${NC}"
+echo -e "${GREEN}  Web Panel URL : http://$IP:$PANEL_PORT${NC}"
 echo -e "${GREEN}=========================================${NC}"
+=====${NC}"
