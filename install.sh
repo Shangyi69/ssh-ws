@@ -488,6 +488,7 @@ cat <<'LIMEOF' > /usr/local/bin/limiter.sh
 LIMIT_DIR="/etc/ws-ssh/limit"
 STATE_FILE="/var/run/ws-ssh/active_conns.json"
 ONLINE_FILE="/var/run/ws-ssh/online_ips.json"
+POLL_SECONDS="${POLL_SECONDS:-3}"
 
 
 mkdir -p "$LIMIT_DIR" "$(dirname "$STATE_FILE")"
