@@ -260,14 +260,21 @@ renew_user() {
 }
 
 check_online() {
-    printf "%-18s %-10s %-10s\n" "USERNAME" "ONLINE" "LIMIT"
-    echo "--------------------------------------------"
+    ONLINE_FILE="/var/run/ws-ssh/online_ips.json"
+    printf "%-18s %-6s %-6s %s\n" "USERNAME" "ONLINE" "LIMIT" "IP LIST"
+    echo "------------------------------------------------------------"
     for f in "$LIMIT_DIR"/*; do
         [[ -e "$f" ]] || continue
         user=$(basename "$f")
         limit=$(cat "$f")
         online=$(ps aux | grep "sshd: $user" | grep -v grep | grep -v "\[priv\]" | wc -l)
-        printf "%-18s %-10s %-10s\n" "$user" "$online" "$limit"
+        # Real IP list from limiter's online_ips.json
+        ip_list="-"
+        if [[ -f "$ONLINE_FILE" ]]; then
+            ip_list=$(jq -r --arg u "$user" '.[$u]? // [] | [.[].ip] | join(", ")' "$ONLINE_FILE" 2>/dev/null)
+            [[ -z "$ip_list" ]] && ip_list="-"
+        fi
+        printf "%-18s %-6s %-6s %s\n" "$user" "$online" "$limit" "$ip_list"
     done
 }
 
@@ -365,18 +372,24 @@ ln -sf /usr/local/bin/menu /usr/bin/menu
 echo -e "${YELLOW}[*] writing limiter.sh ...${NC}"
 cat <<'LIMEOF' > /usr/local/bin/limiter.sh
 #!/bin/bash
-# limiter.sh - runs as a daemon (systemd), polls every few seconds.
-# For each managed user, counts active sshd sessions (correlated to the
-# real client IP via /var/run/ws-ssh/active_conns.json written by
-# ws-proxy.py). If a user has more active sessions than their configured
-# limit, the newest excess sessions are killed and their IP is banned.
+# limiter.sh - daemon: device-limit + expiry + auto-ban
+# Architecture:
+#   ws-proxy.py stores real client IPs in STATE_FILE keyed by
+#   the local ephemeral port it used to connect to sshd:22.
+#   ss -tnp sport=:22 shows those connections as 127.0.0.1:EPORT -> 127.0.0.1:22
+#   We look up EPORT in STATE_FILE to recover the real client IP.
+#
+# ONLINE_FILE: /var/run/ws-ssh/online_ips.json
+#   Written each poll cycle so the web panel can display real IPs.
+#   Format: {"username": [{"ip":"x.x.x.x","pid":1234,"ts":1234567890}, ...]}
 
 LIMIT_DIR="/etc/ws-ssh/limit"
 STATE_FILE="/var/run/ws-ssh/active_conns.json"
+ONLINE_FILE="/var/run/ws-ssh/online_ips.json"
 BANLOG="/etc/ws-ssh/banned_ips.list"
 POLL_SECONDS="${POLL_SECONDS:-5}"
 
-mkdir -p "$LIMIT_DIR"
+mkdir -p "$LIMIT_DIR" "$(dirname "$STATE_FILE")"
 touch "$BANLOG"
 
 is_banned() {
@@ -385,9 +398,10 @@ is_banned() {
 
 ban_ip() {
     local ip="$1"
-    [[ -z "$ip" || "$ip" == "unknown" || "$ip" == "127.0.0.1" ]] && return
+    # Only skip empty or truly unresolvable
+    [[ -z "$ip" || "$ip" == "unknown" ]] && return
     if ! is_banned "$ip"; then
-        iptables -I INPUT -s "$ip" -j DROP
+        iptables -I INPUT -s "$ip" -j DROP 2>/dev/null
         echo "$ip" >> "$BANLOG"
         logger -t ws-ssh-limiter "banned IP $ip (device limit exceeded)"
     fi
@@ -414,52 +428,83 @@ kill_expired() {
 
 one_pass() {
     [[ -d "$LIMIT_DIR" ]] || return
-    [[ -f "$STATE_FILE" ]] || return
 
-    # username -> "pid:ts:ip" lines
+    # Build per-user session list: user -> array of "pid|ts|ip"
     declare -A sessions
 
-    while read -r line; do
-        # ss -H -tnp output, established conns where local port is 22
+    # ss output for established conns on port 22
+    # Format: ESTAB  0  0  127.0.0.1:22  127.0.0.1:EPORT  users:(("sshd",pid=NNN,...))
+    while IFS= read -r line; do
         local_addr=$(awk '{print $4}' <<< "$line")
         peer_addr=$(awk '{print $5}' <<< "$line")
-        [[ "$local_addr" != *:22 ]] && continue
 
-        # peer_port is the ephemeral port ws-proxy used when connecting to sshd
-        # This matches the key stored in active_conns.json by ws-proxy.py
-        peer_port="${peer_addr##*:}"
-        pid=$(grep -oP 'pid=\K[0-9]+' <<< "$line")
+        # Only care about sshd side (local port 22)
+        [[ "$local_addr" == *:22 ]] || continue
+
+        # Ephemeral port ws-proxy used — this is the STATE_FILE lookup key
+        eport="${peer_addr##*:}"
+        [[ "$eport" =~ ^[0-9]+$ ]] || continue
+
+        # Extract sshd pid
+        pid=$(grep -oP 'pid=\K[0-9]+' <<< "$line" | head -1)
         [[ -z "$pid" ]] && continue
 
-        user=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
+        # Get the OS user running this sshd child
+        user=$(ps -o user= -p "$pid" 2>/dev/null | tr -d '[:space:]')
         [[ -z "$user" ]] && continue
         [[ -f "$LIMIT_DIR/$user" ]] || continue
 
-        ip=$(jq -r --arg p "$peer_port" '.[$p].ip // "unknown"' "$STATE_FILE" 2>/dev/null)
-        ts=$(jq -r --arg p "$peer_port" '.[$p].ts // 0' "$STATE_FILE" 2>/dev/null)
+        # Lookup real client IP and connect timestamp from ws-proxy state
+        real_ip="unknown"
+        ts="0"
+        if [[ -f "$STATE_FILE" ]]; then
+            real_ip=$(jq -r --arg p "$eport" '.[$p].ip // "unknown"' "$STATE_FILE" 2>/dev/null)
+            ts=$(jq -r --arg p "$eport" '.[$p].ts // 0' "$STATE_FILE" 2>/dev/null)
+            # Fallback: if lookup gave empty string
+            [[ -z "$real_ip" ]] && real_ip="unknown"
+        fi
 
-        sessions["$user"]+="$pid:$ts:$ip"$'\n'
+        sessions["$user"]+="${pid}|${ts}|${real_ip}"$'\n'
     done < <(ss -H -tnp state established '( sport = :22 )' 2>/dev/null)
 
+    # Write online_ips.json for the web panel
+    {
+        echo "{"
+        local first_user=1
+        for user in "${!sessions[@]}"; do
+            [[ $first_user -eq 0 ]] && echo ","
+            first_user=0
+            echo "  \"$user\": ["
+            local first_entry=1
+            while IFS= read -r entry; do
+                [[ -z "$entry" ]] && continue
+                IFS='|' read -r pid ts ip <<< "$entry"
+                [[ $first_entry -eq 0 ]] && echo ","
+                first_entry=0
+                printf '    {"ip":"%s","pid":%s,"ts":%s}' "$ip" "$pid" "$ts"
+            done <<< "${sessions[$user]}"
+            echo ""
+            echo "  ]"
+        done
+        echo "}"
+    } > "${ONLINE_FILE}.tmp" 2>/dev/null && mv "${ONLINE_FILE}.tmp" "$ONLINE_FILE"
+
+    # Enforce device limits
     for user in "${!sessions[@]}"; do
         limit=$(cat "$LIMIT_DIR/$user" 2>/dev/null)
-        [[ -z "$limit" ]] && continue
+        [[ "$limit" =~ ^[0-9]+$ ]] || continue
 
-        # sort oldest-first, keep $limit sessions, kill newest excess
-        mapfile -t lines < <(printf '%s' "${sessions[$user]}" | grep -v '^$' | sort -t: -k2 -n)
+        # Sort by timestamp ascending (oldest first), kill newest excess
+        mapfile -t lines < <(printf '%s' "${sessions[$user]}" | grep -v '^$' | sort -t'|' -k2 -n)
         count=${#lines[@]}
         [[ "$count" -le "$limit" ]] && continue
 
         excess=$(( count - limit ))
-        # kill newest (last $excess entries after sort)
-        for ((i = count - excess; i < count; i++)); do
-            entry="${lines[$i]}"
-            pid="${entry%%:*}"
-            rest="${entry#*:*:}"
-            ip="${rest}"
-            kill -9 "$pid" 2>/dev/null
+        for (( i = count - excess; i < count; i++ )); do
+            IFS='|' read -r pid ts ip <<< "${lines[$i]}"
+            kill -9 "$pid" 2>/dev/null && \
+                logger -t ws-ssh-limiter "user=$user limit=$limit count=$count -> killed pid=$pid ip=$ip"
             ban_ip "$ip"
-            logger -t ws-ssh-limiter "user=$user limit=$limit exceeded -> killed pid=$pid ip=$ip"
         done
     done
 }

@@ -105,6 +105,8 @@ def get_expire(user):
     return "-"
 
 
+ONLINE_FILE = "/var/run/ws-ssh/online_ips.json"
+
 def get_online_count(user):
     try:
         out = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=5).stdout
@@ -112,6 +114,19 @@ def get_online_count(user):
         return sum(1 for line in out.splitlines() if needle in line and "grep" not in line and "[priv]" not in line)
     except Exception:
         return 0
+
+
+def get_online_ips(user):
+    """Return list of real client IPs from limiter's online_ips.json"""
+    try:
+        if not os.path.exists(ONLINE_FILE):
+            return []
+        with open(ONLINE_FILE) as f:
+            data = json.load(f)
+        sessions = data.get(user, [])
+        return [s.get("ip", "unknown") for s in sessions if s.get("ip") and s.get("ip") != "unknown"]
+    except Exception:
+        return []
 
 
 def get_usage_gb(user):
@@ -154,6 +169,7 @@ def list_users():
                 "expire": get_expire(user),
                 "limit": limit,
                 "online": get_online_count(user),
+                "online_ips": get_online_ips(user),
                 "usage_gb": get_usage_gb(user),
             }
         )
@@ -451,6 +467,11 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
     padding:6px 10px 6px 14px; font-size:13px; display:flex; gap:8px; align-items:center;
   }
   .ipchip button{background:none; border:none; color:var(--red); cursor:pointer; font-size:13px;}
+  .ipbadge{
+    display:inline-block; background:rgba(79,140,255,.12); color:var(--accent);
+    border:1px solid rgba(79,140,255,.25); border-radius:6px;
+    padding:2px 7px; font-size:11px; font-family:monospace; margin:1px;
+  }
 
   /* modal */
   .overlay{
@@ -503,7 +524,7 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
       <thead>
         <tr>
           <th>Username</th><th>Password</th><th>Expire</th><th>Limit</th>
-          <th>Online</th><th>Usage (GB)</th><th>Actions</th>
+          <th>Online</th><th>IP List</th><th>Usage (GB)</th><th>Actions</th>
         </tr>
       </thead>
       <tbody id="userRows">
@@ -515,6 +536,15 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
           <td data-label="Limit">{{ u.limit }}</td>
           <td data-label="Online">
             <span class="badge {{ 'on' if u.online > 0 else 'off' }}">{{ u.online }}</span>
+          </td>
+          <td data-label="IP List">
+            {% if u.online_ips %}
+              {% for ip in u.online_ips %}
+                <span class="ipbadge">{{ ip }}</span>
+              {% endfor %}
+            {% else %}
+              <span class="muted">-</span>
+            {% endif %}
           </td>
           <td data-label="Usage">{{ u.usage_gb }}</td>
           <td data-label="Actions">
