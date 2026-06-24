@@ -474,9 +474,11 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
   .msg.err{color:var(--red);}
   .msg.ok{color:var(--green);}
   @media (max-width:720px){
-    table, thead{display:none;}
-    tbody tr{display:block; border-bottom:1px solid var(--border); padding:10px 0;}
-    tbody td{display:flex; justify-content:space-between; border-bottom:none; padding:4px 14px;}
+    table{display:block; border:none; background:none;}
+    thead{display:none;}
+    tbody{display:block;}
+    tbody tr{display:block; background:var(--card); border:1px solid var(--border); border-radius:12px; margin-bottom:10px;}
+    tbody td{display:flex; justify-content:space-between; border-bottom:none; padding:8px 14px;}
     tbody td::before{content:attr(data-label); color:var(--muted); font-size:12px;}
   }
 </style>
@@ -714,6 +716,7 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now ws-panel.service
+systemctl restart ws-panel.service
 
 if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
     ufw allow "${PANEL_PORT}"/tcp
