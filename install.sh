@@ -3,7 +3,7 @@
 # SSH + WebSocket account-management installer
 # Creates: /usr/local/bin/ws-proxy.py (WS<->SSH forwarder)
 #          /usr/local/bin/menu        (admin menu)
-#          /usr/local/bin/limiter.sh  (device-limit + expiry + auto-ban daemon)
+#          /usr/local/bin/limiter.sh  (device-limit + expiry enforcer daemon)
 #--------------------------------------------------------
 set -e
 
@@ -30,7 +30,6 @@ grep -q '^PasswordAuthentication' /etc/ssh/sshd_config || echo 'PasswordAuthenti
 systemctl restart ssh || systemctl restart sshd
 
 mkdir -p /etc/ws-ssh/limit /etc/ws-ssh/info /var/run/ws-ssh
-touch /etc/ws-ssh/banned_ips.list
 
 echo -e "${YELLOW}[*] writing ws-proxy.py ...${NC}"
 cat <<'PYEOF' > /usr/local/bin/ws-proxy.py
@@ -614,7 +613,7 @@ EOF
 
 cat <<'EOF' > /etc/systemd/system/ws-limiter.service
 [Unit]
-Description=SSH-WS per-user device limiter / expiry enforcer / auto-ban
+Description=SSH-WS per-user device limiter / expiry enforcer
 After=network.target
 
 [Service]

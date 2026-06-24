@@ -17,14 +17,13 @@ apt install -y python3 python3-pip >/dev/null
 pip3 install -q flask werkzeug --break-system-packages 2>/dev/null || pip3 install -q flask werkzeug
 
 mkdir -p /opt/ws-panel/templates /etc/ws-ssh/panel /etc/ws-ssh/limit /etc/ws-ssh/info
-touch /etc/ws-ssh/banned_ips.list
 
 echo -e "${YELLOW}[*] writing app.py ...${NC}"
 cat <<'APPEOF' > /opt/ws-panel/app.py
 #!/usr/bin/env python3
 """ws-panel: lightweight X-ui style web panel for the SSH+WebSocket account
 manager. Reuses the same on-disk data the CLI `menu` uses, so both stay in
-sync (/etc/ws-ssh/limit, /etc/ws-ssh/info, /etc/ws-ssh/banned_ips.list)."""
+sync (/etc/ws-ssh/limit, /etc/ws-ssh/info)."""
 
 import json
 import os
@@ -39,7 +38,6 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 LIMIT_DIR = "/etc/ws-ssh/limit"
 INFO_DIR = "/etc/ws-ssh/info"
-BANLOG = "/etc/ws-ssh/banned_ips.list"
 PANEL_DIR = "/etc/ws-ssh/panel"
 AUTH_FILE = os.path.join(PANEL_DIR, "auth.json")
 SECRET_FILE = os.path.join(PANEL_DIR, "secret.key")
@@ -52,8 +50,6 @@ app = Flask(__name__)
 def ensure_dirs():
     for d in (LIMIT_DIR, INFO_DIR, PANEL_DIR):
         os.makedirs(d, exist_ok=True)
-    if not os.path.exists(BANLOG):
-        open(BANLOG, "a").close()
 
 
 def get_secret_key():
@@ -222,15 +218,6 @@ def logout():
 @login_required
 def dashboard():
     return render_template("dashboard.html", users=list_users(), panel_user=load_auth()["username"])
-
-
-@app.route("/api/banned")
-@login_required
-def api_banned():
-    ensure_dirs()
-    with open(BANLOG) as f:
-        ips = [l.strip() for l in f if l.strip()]
-    return jsonify(ips=ips)
 
 
 @app.route("/api/create", methods=["POST"])
@@ -409,12 +396,12 @@ cat <<'LOGINEOF' > /opt/ws-panel/templates/login.html
 <body>
   <form class="card" method="post" action="/login">
     <h1>SSH-WS Panel</h1>
-    <p class="sub">Admin login</p>
-    <label>Username</label>
+    <p class="sub">အက်ဒမင် အကောင့်ဝင်ရန်</p>
+    <label>အသုံးပြုသူအမည်</label>
     <input name="username" autocomplete="username" required>
-    <label>Password</label>
+    <label>စကားဝှက်</label>
     <input name="password" type="password" autocomplete="current-password" required>
-    <button type="submit">Login</button>
+    <button type="submit">ဝင်မည်</button>
     {% if error %}<div class="err">{{ error }}</div>{% endif %}
   </form>
 </body>
@@ -472,6 +459,9 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
   .badge.on{background:rgba(51,196,129,.15); color:var(--green);}
   .badge.off{background:rgba(139,147,163,.15); color:var(--muted);}
   .badge.expired{background:rgba(239,79,95,.15); color:var(--red);}
+  tr.expired-row{background:rgba(239,79,95,.10);}
+  tr.expired-row:hover{background:rgba(239,79,95,.16);}
+  tr.expired-row td:first-child b{color:var(--red);}
   .actions{display:flex; gap:6px; flex-wrap:wrap;}
   .card{background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px; margin-top:24px;}
   .card h2{font-size:15px; margin:0 0 12px;}
@@ -523,41 +513,41 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
     <h1>SSH-WS Panel</h1>
     <div class="right">
       <span class="muted">{{ panel_user }}</span>
-      <button class="btn ghost small" onclick="openModal('pwModal')">Change Password</button>
-      <a class="btn ghost small" href="/logout" style="text-decoration:none;">Logout</a>
+      <button class="btn ghost small" onclick="openModal('pwModal')">စကားဝှက်ပြောင်းမည်</button>
+      <a class="btn ghost small" href="/logout" style="text-decoration:none;">ထွက်မည်</a>
     </div>
   </header>
 
   <main>
     <div class="toolbar">
-      <div class="muted">Total users: {{ users|length }}</div>
-      <button class="btn green" onclick="openModal('createModal')">+ Create User</button>
+      <div class="muted">စုစုပေါင်းအသုံးပြုသူ: {{ users|length }}</div>
+      <button class="btn green" onclick="openModal('createModal')">+ အသုံးပြုသူဖန်တီးမည်</button>
     </div>
 
     <table>
       <thead>
         <tr>
-          <th>Username</th><th>Password</th><th>Expire</th><th>Limit</th>
-          <th>Online</th><th>IP List</th><th>Usage (GB)</th><th>Actions</th>
+          <th>အသုံးပြုသူအမည်</th><th>စကားဝှက်</th><th>သက်တမ်းကုန်ဆုံး</th><th>ကန့်သတ်ချက်</th>
+          <th>အွန်လိုင်း</th><th>IP စာရင်း</th><th>အသုံးပြုမှု (GB)</th><th>လုပ်ဆောင်ချက်များ</th>
         </tr>
       </thead>
       <tbody id="userRows">
         {% for u in users %}
-        <tr data-user="{{ u.username }}">
-          <td data-label="Username"><b>{{ u.username }}</b></td>
-          <td data-label="Password"><span class="pw" title="click to copy" onclick="copyText('{{ u.password }}')">{{ u.password }}</span></td>
-          <td data-label="Expire">
+        <tr data-user="{{ u.username }}"{% if u.expired %} class="expired-row"{% endif %}>
+          <td data-label="အသုံးပြုသူအမည်"><b>{{ u.username }}</b></td>
+          <td data-label="စကားဝှက်"><span class="pw" title="click to copy" onclick="copyText('{{ u.password }}')">{{ u.password }}</span></td>
+          <td data-label="သက်တမ်းကုန်ဆုံး">
             {% if u.expired %}
-              <span class="badge expired">{{ u.expire }} (expired)</span>
+              <span class="badge expired">{{ u.expire }} [EXPIRED]</span>
             {% else %}
               {{ u.expire }}
             {% endif %}
           </td>
-          <td data-label="Limit">{{ u.limit }}</td>
-          <td data-label="Online">
+          <td data-label="ကန့်သတ်ချက်">{{ u.limit }}</td>
+          <td data-label="အွန်လိုင်း">
             <span class="badge {{ 'on' if u.online > 0 else 'off' }}">{{ u.online }}</span>
           </td>
-          <td data-label="IP List">
+          <td data-label="IP စာရင်း">
             {% if u.online_ips %}
               {% for ip in u.online_ips %}
                 <span class="ipbadge">{{ ip }}</span>
@@ -566,13 +556,13 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
               <span class="muted">-</span>
             {% endif %}
           </td>
-          <td data-label="Usage">{{ u.usage_gb }}</td>
-          <td data-label="Actions">
+          <td data-label="အသုံးပြုမှု">{{ u.usage_gb }}</td>
+          <td data-label="လုပ်ဆောင်ချက်များ">
             <div class="actions">
-              <button class="btn small" onclick="openRenew('{{ u.username }}')">Renew</button>
-              <button class="btn ghost small" onclick="openLimit('{{ u.username }}','{{ u.limit }}')">Limit</button>
-              <button class="btn small" style="background:var(--yellow);color:#000" onclick="doKick('{{ u.username }}')">Kick</button>
-              <button class="btn red small" onclick="doDelete('{{ u.username }}')">Delete</button>
+              <button class="btn small" onclick="openRenew('{{ u.username }}')">သက်တမ်းတိုးမည်</button>
+              <button class="btn ghost small" onclick="openLimit('{{ u.username }}','{{ u.limit }}')">ကန့်သတ်မည်</button>
+              <button class="btn small" style="background:var(--yellow);color:#000" onclick="doKick('{{ u.username }}')">ထုတ်ပစ်မည်</button>
+              <button class="btn red small" onclick="doDelete('{{ u.username }}')">ဖျက်မည်</button>
             </div>
           </td>
         </tr>
@@ -585,15 +575,15 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
   <!-- Create modal -->
   <div class="overlay" id="createModal">
     <div class="modal">
-      <h3>Create User</h3>
-      <label>Username</label><input id="c_user">
-      <label>Password</label><input id="c_pass">
+      <h3>အသုံးပြုသူဖန်တီးမည်</h3>
+      <label>အသုံးပြုသူအမည်</label><input id="c_user">
+      <label>စကားဝှက်</label><input id="c_pass">
       <label>သက်တမ်း (ရက်ပေါင်း)</label><input id="c_days" type="number" value="30">
-      <label>Device limit</label><input id="c_limit" type="number" value="1">
+      <label>ကန့်သတ်ချက်</label><input id="c_limit" type="number" value="1">
       <div class="msg" id="c_msg"></div>
       <div class="row">
-        <button class="btn ghost" onclick="closeModal('createModal')">Cancel</button>
-        <button class="btn green" onclick="doCreate()">Create</button>
+        <button class="btn ghost" onclick="closeModal('createModal')">မလုပ်တော့ပါ</button>
+        <button class="btn green" onclick="doCreate()">ဖန်တီးမည်</button>
       </div>
     </div>
   </div>
@@ -601,12 +591,12 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
   <!-- Renew modal -->
   <div class="overlay" id="renewModal">
     <div class="modal">
-      <h3>Renew <span id="r_user_label"></span></h3>
+      <h3>သက်တမ်းတိုးမည် <span id="r_user_label"></span></h3>
       <label>ထပ်ထည့်မည့်ရက်ပေါင်း</label><input id="r_days" type="number" value="30">
       <div class="msg" id="r_msg"></div>
       <div class="row">
-        <button class="btn ghost" onclick="closeModal('renewModal')">Cancel</button>
-        <button class="btn" onclick="doRenew()">Renew</button>
+        <button class="btn ghost" onclick="closeModal('renewModal')">မလုပ်တော့ပါ</button>
+        <button class="btn" onclick="doRenew()">သက်တမ်းတိုးမည်</button>
       </div>
     </div>
   </div>
@@ -614,12 +604,12 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
   <!-- Limit modal -->
   <div class="overlay" id="limitModal">
     <div class="modal">
-      <h3>Set limit <span id="l_user_label"></span></h3>
-      <label>Device limit</label><input id="l_value" type="number" value="1">
+      <h3>ကန့်သတ်ချက်သတ်မှတ်မည် <span id="l_user_label"></span></h3>
+      <label>ကန့်သတ်ချက်</label><input id="l_value" type="number" value="1">
       <div class="msg" id="l_msg"></div>
       <div class="row">
-        <button class="btn ghost" onclick="closeModal('limitModal')">Cancel</button>
-        <button class="btn" onclick="doLimit()">Save</button>
+        <button class="btn ghost" onclick="closeModal('limitModal')">မလုပ်တော့ပါ</button>
+        <button class="btn" onclick="doLimit()">သိမ်းမည်</button>
       </div>
     </div>
   </div>
@@ -627,13 +617,13 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
   <!-- Change password modal -->
   <div class="overlay" id="pwModal">
     <div class="modal">
-      <h3>Change Panel Password</h3>
-      <label>New username (optional)</label><input id="pw_user" placeholder="{{ panel_user }}">
-      <label>New password</label><input id="pw_pass" type="password">
+      <h3>Panel စကားဝှက်ပြောင်းမည်</h3>
+      <label>အသုံးပြုသူအမည်အသစ် (ရွေးချယ်နိုင်)</label><input id="pw_user" placeholder="{{ panel_user }}">
+      <label>စကားဝှက်အသစ်</label><input id="pw_pass" type="password">
       <div class="msg" id="pw_msg"></div>
       <div class="row">
-        <button class="btn ghost" onclick="closeModal('pwModal')">Cancel</button>
-        <button class="btn" onclick="doChangePassword()">Save</button>
+        <button class="btn ghost" onclick="closeModal('pwModal')">မလုပ်တော့ပါ</button>
+        <button class="btn" onclick="doChangePassword()">သိမ်းမည်</button>
       </div>
     </div>
   </div>
