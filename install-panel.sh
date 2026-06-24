@@ -319,9 +319,15 @@ def api_renew():
     r = subprocess.run(["chage", "-E", exp, user])
     if r.returncode != 0:
         return jsonify(ok=False, error="renew failed"), 500
-    # Clear any PAM failed-login lockout left over from connection attempts
-    # made while the account was expired (chage -E alone does not reset this).
-    for cmd in (["faillock", "--user", user, "--reset"], ["pam_tally2", "--user", user, "--reset"]):
+    # Unlock the password (strip a leading "!" in /etc/shadow, if present)
+    # and clear any PAM failed-login lockout — either can be left behind
+    # from the time the account was expired, and chage -E alone won't
+    # clear them.
+    for cmd in (
+        ["passwd", "-u", user],
+        ["faillock", "--user", user, "--reset"],
+        ["pam_tally2", "--user", user, "--reset"],
+    ):
         try:
             subprocess.run(cmd, capture_output=True)
         except FileNotFoundError:
