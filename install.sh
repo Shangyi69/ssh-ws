@@ -344,6 +344,10 @@ renew_user() {
     read -rp "ထပ်ထည့်မည့်ရက်ပေါင်း (e.g. 30): " days
     exp=$(date -d "+${days} days" +%Y-%m-%d)
     chage -E "$exp" "$user"
+    # Clear any PAM failed-login lockout left over from connection attempts
+    # made while the account was expired (chage -E alone does not reset this).
+    faillock --user "$user" --reset 2>/dev/null
+    pam_tally2 --user "$user" --reset >/dev/null 2>&1
     echo -e "${GREEN}[+] '$user' အသက်တမ်းသစ် -> $exp${NC}"
 }
 
