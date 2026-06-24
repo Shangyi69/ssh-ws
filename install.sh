@@ -563,26 +563,23 @@ one_pass() {
         printf '\n}\n'
     } > "${ONLINE_FILE}.tmp" 2>/dev/null && mv "${ONLINE_FILE}.tmp" "$ONLINE_FILE"
 
-    # ── Enforce limits: keep oldest, kill newest ──────────────────────────
+    # ── Enforce limits: same action as Panel/Menu "Kick" button ───────────
+    # If a user has MORE active sessions than their device limit, kick ALL
+    # of that user's sessions immediately (pkill -9 -u user) — identical to
+    # clicking "Kick" in the panel. This loop runs every POLL_SECONDS, 24/7,
+    # so it's effectively an automatic "Kick" click whenever the limit is
+    # exceeded. The user can simply reconnect down to their allowed count.
     for user in "${!sessions[@]}"; do
         limit=$(cat "$LIMIT_DIR/$user" 2>/dev/null)
         [[ "$limit" =~ ^[0-9]+$ ]] || continue
 
-        # Sort ascending by timestamp → oldest first
-        mapfile -t lines < <(
-            printf '%s' "${sessions[$user]}" | grep -v '^$' | sort -t'|' -k1 -n
-        )
-        count=${#lines[@]}
+        count=$(printf '%s' "${sessions[$user]}" | grep -c '^[^[:space:]]')
         [[ $count -le $limit ]] && continue
 
-        # Kill lines[$limit]..lines[$count-1]  (newest excess)
-        for (( i = limit; i < count; i++ )); do
-            IFS='|' read -r ts pid ip <<< "${lines[$i]}"
-            if kill -9 "$pid" 2>/dev/null; then
-                logger -t ws-ssh-limiter \
-                    "user=$user limit=$limit count=$count -> killed newest pid=$pid ip=$ip"
-            fi
-        done
+        if pkill -9 -u "$user" 2>/dev/null; then
+            logger -t ws-ssh-limiter \
+                "user=$user limit=$limit count=$count -> auto-kicked ALL sessions (over limit)"
+        fi
     done
 }
 
