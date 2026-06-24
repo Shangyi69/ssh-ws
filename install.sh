@@ -266,7 +266,8 @@ check_online() {
         [[ -e "$f" ]] || continue
         user=$(basename "$f")
         limit=$(cat "$f")
-        online=$(ps aux | grep "sshd: $user" | grep -v grep | wc -l)
+        # ပြင်ဆင်ချက် - [priv] ပါသော process အပိုများကြောင့် ၂ ဆမပေါ်စေရန် ဖယ်ထုတ်ရေတွက်ခြင်း
+        online=$(ps aux | grep "sshd: $user" | grep -v grep | grep -v "\[priv\]" | wc -l)
         printf "%-18s %-10s %-10s\n" "$user" "$online" "$limit"
     done
 }
@@ -281,7 +282,8 @@ user_info_list() {
         [[ -z "$pass" ]] && pass="-"
         exp=$(chage -l "$user" 2>/dev/null | awk -F': ' '/Account expires/ {print $2}')
         [[ -z "$exp" ]] && exp="-"
-        online=$(ps aux | grep "sshd: $user" | grep -v grep | wc -l)
+        # ပြင်ဆင်ချက် - [priv] ပါသော process အပိုများကြောင့် ၂ ဆမပေါ်စေရန် ဖယ်ထုတ်ရေတွက်ခြင်း
+        online=$(ps aux | grep "sshd: $user" | grep -v grep | grep -v "\[priv\]" | wc -l)
         printf "%-14s %-14s %-12s %-8s\n" "$user" "$pass" "$exp" "$online"
     done
 }
@@ -436,6 +438,11 @@ one_pass() {
         ip=$(jq -r --arg p "$peer_port" '.[$p].ip // "unknown"' "$STATE_FILE" 2>/dev/null)
         ts=$(jq -r --arg p "$peer_port" '.[$p].ts // 0' "$STATE_FILE" 2>/dev/null)
 
+        # ပြင်ဆင်ချက် - IP မသိရလျှင် ss ထဲမှ Peer IP လိပ်စာကို တိုက်ရိုက်ရယူရန်
+        if [[ "$ip" == "unknown" || -z "$ip" ]]; then
+            ip="${peer_addr%:*}"
+        fi
+
         sessions["$user"]+="$pid:$ts:$ip"$'\n'
     done < <(ss -H -tnp state established '( sport = :22 )' 2>/dev/null)
 
@@ -452,9 +459,15 @@ one_pass() {
         for ((i = count - excess; i < count; i++)); do
             entry="${lines[$i]}"
             pid="${entry%%:*}"
-            ip="${entry##*:}"
+            
+            # ပြင်ဆင်ချက် - Format အလိုက် တကယ့် client IP အမှန်ကို သေချာစွာ ရယူခြင်း
+            rest="${entry#*:}"
+            ip="${rest#*:}"
+            
             kill -9 "$pid" 2>/dev/null
-            ban_ip "$ip"
+            if [[ -n "$ip" && "$ip" != "unknown" && "$ip" != "127.0.0.1" ]]; then
+                ban_ip "$ip"
+            fi
             logger -t ws-ssh-limiter "user=$user limit=$limit exceeded -> killed pid=$pid ip=$ip"
         done
     done
