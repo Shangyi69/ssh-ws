@@ -105,6 +105,23 @@ def get_expire(user):
     return "-"
 
 
+def is_expired(expire_str):
+    """Return True if account is expired."""
+    if not expire_str or expire_str in ("-", "never"):
+        return False
+    try:
+        from datetime import datetime
+        exp = datetime.strptime(expire_str.strip(), "%b %d, %Y")
+        return exp < datetime.now()
+    except Exception:
+        try:
+            from datetime import datetime
+            exp = datetime.strptime(expire_str.strip(), "%Y-%m-%d")
+            return exp < datetime.now()
+        except Exception:
+            return False
+
+
 ONLINE_FILE = "/var/run/ws-ssh/online_ips.json"
 
 def get_online_count(user):
@@ -162,11 +179,13 @@ def list_users():
             limit = "-"
         info_path = os.path.join(INFO_DIR, user)
         password = open(info_path).read().strip() if os.path.exists(info_path) else "-"
+        exp = get_expire(user)
         rows.append(
             {
                 "username": user,
                 "password": password,
-                "expire": get_expire(user),
+                "expire": exp,
+                "expired": is_expired(exp),
                 "limit": limit,
                 "online": get_online_count(user),
                 "online_ips": get_online_ips(user),
@@ -527,7 +546,13 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
         <tr data-user="{{ u.username }}">
           <td data-label="Username"><b>{{ u.username }}</b></td>
           <td data-label="Password"><span class="pw" title="click to copy" onclick="copyText('{{ u.password }}')">{{ u.password }}</span></td>
-          <td data-label="Expire">{{ u.expire }}</td>
+          <td data-label="Expire">
+            {% if u.expired %}
+              <span class="badge expired">{{ u.expire }} (expired)</span>
+            {% else %}
+              {{ u.expire }}
+            {% endif %}
+          </td>
           <td data-label="Limit">{{ u.limit }}</td>
           <td data-label="Online">
             <span class="badge {{ 'on' if u.online > 0 else 'off' }}">{{ u.online }}</span>

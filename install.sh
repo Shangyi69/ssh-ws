@@ -36,59 +36,89 @@ echo -e "${YELLOW}[*] writing ws-proxy.py ...${NC}"
 cat <<'PYEOF' > /usr/local/bin/ws-proxy.py
 #!/usr/bin/env python3
 """
-ws-proxy.py
-SSH-over-WebSocket forwarder.
-Listens on WS_PORT, does a minimal HTTP/WebSocket handshake (accepts any
-request, answers 101), then bridges raw bytes to 127.0.0.1:SSH_PORT.
+ws-proxy.py  —  SSH-over-WebSocket forwarder (robust edition)
 
-While a connection is active it records {local_ephemeral_port: {ip, ts}}
-into STATE_FILE so that limiter.sh can later match an established
-sshd<->127.0.0.1 session (seen via `ss -tnp`) back to the real client IP.
+* SO_REUSEADDR + SO_REUSEPORT  → fast restart, no "port in use" crash
+* Per-connection exception isolation → one bad client never kills the server
+* Graceful SIGTERM/SIGINT handling → cleans up state file on shutdown
+* Automatic state-file GC → stale entries removed every 60 s
+* sshd connect retry → tolerates a brief sshd restart without dropping proxy
 """
 
 import asyncio
 import json
+import logging
 import os
+import signal
 import sys
 import time
 
-WS_PORT = int(os.environ.get("WS_PORT", "8880"))
-SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
+logging.basicConfig(
+    level=logging.INFO,
+    format="[ws-proxy] %(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("ws-proxy")
+
+WS_PORT   = int(os.environ.get("WS_PORT",  "8880"))
+SSH_PORT  = int(os.environ.get("SSH_PORT", "22"))
 STATE_FILE = "/var/run/ws-ssh/active_conns.json"
+GC_INTERVAL = 60   # seconds between state-file garbage-collection passes
 
 _lock = asyncio.Lock()
+_shutdown = False
 
 
-async def _load_state():
+# ── state file helpers ────────────────────────────────────────────────────────
+
+def _load_state_sync():
     try:
-        with open(STATE_FILE, "r") as f:
+        with open(STATE_FILE) as f:
             return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except Exception:
         return {}
 
 
-async def _save_state(state):
+def _save_state_sync(state):
     tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f)
-    os.replace(tmp, STATE_FILE)
+    try:
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        log.warning("state save failed: %s", e)
 
 
 async def _register(port, ip):
     async with _lock:
-        state = await _load_state()
+        state = _load_state_sync()
         state[str(port)] = {"ip": ip, "ts": time.time()}
-        await _save_state(state)
+        _save_state_sync(state)
 
 
 async def _unregister(port):
     async with _lock:
-        state = await _load_state()
+        state = _load_state_sync()
         state.pop(str(port), None)
-        await _save_state(state)
+        _save_state_sync(state)
 
 
-async def _relay(reader, writer):
+async def _gc_state():
+    """Remove entries older than 24 h (safety net for leaked entries)."""
+    while not _shutdown:
+        await asyncio.sleep(GC_INTERVAL)
+        async with _lock:
+            state = _load_state_sync()
+            cutoff = time.time() - 86400
+            cleaned = {k: v for k, v in state.items() if v.get("ts", 0) > cutoff}
+            if len(cleaned) != len(state):
+                _save_state_sync(cleaned)
+                log.info("gc: removed %d stale entries", len(state) - len(cleaned))
+
+
+# ── relay ─────────────────────────────────────────────────────────────────────
+
+async def _relay(reader, writer, label=""):
     try:
         while True:
             data = await reader.read(65536)
@@ -98,81 +128,143 @@ async def _relay(reader, writer):
             await writer.drain()
     except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
         pass
+    except Exception as e:
+        log.debug("relay %s: %s", label, e)
     finally:
         try:
             writer.close()
+            await writer.wait_closed()
         except Exception:
             pass
 
 
+# ── client handler ────────────────────────────────────────────────────────────
+
 async def handle_client(client_reader, client_writer):
     peer = client_writer.get_extra_info("peername")
     client_ip = peer[0] if peer else "unknown"
-
-    # --- minimal WS handshake: accept any initial HTTP request, answer 101.
-    # If the first bytes don't look like an HTTP request, treat them as
-    # already being SSH traffic and just forward them through untouched.
-    try:
-        first = await asyncio.wait_for(client_reader.read(4096), timeout=5)
-    except asyncio.TimeoutError:
-        first = b""
-
-    leftover = b""
-    if first.startswith(b"GET") or b"HTTP/1." in first[:64]:
-        client_writer.write(
-            b"HTTP/1.1 101 Switching Protocols\r\n"
-            b"Upgrade: websocket\r\n"
-            b"Connection: Upgrade\r\n\r\n"
-        )
-        await client_writer.drain()
-    else:
-        leftover = first
-
-    # --- connect to local sshd
-    try:
-        ssh_reader, ssh_writer = await asyncio.open_connection("127.0.0.1", SSH_PORT)
-    except OSError:
-        client_writer.close()
-        return
-
-    local_port = ssh_writer.get_extra_info("sockname")[1]
-    await _register(local_port, client_ip)
-
-    if leftover:
-        ssh_writer.write(leftover)
-        await ssh_writer.drain()
+    local_port = None
 
     try:
+        # ── WebSocket / plain-SSH handshake ──────────────────────────────
+        try:
+            first = await asyncio.wait_for(client_reader.read(4096), timeout=10)
+        except asyncio.TimeoutError:
+            log.debug("handshake timeout from %s", client_ip)
+            return
+
+        if not first:
+            return
+
+        leftover = b""
+        if first.startswith(b"GET") or b"HTTP/1." in first[:64]:
+            try:
+                client_writer.write(
+                    b"HTTP/1.1 101 Switching Protocols\r\n"
+                    b"Upgrade: websocket\r\n"
+                    b"Connection: Upgrade\r\n\r\n"
+                )
+                await client_writer.drain()
+            except Exception:
+                return
+        else:
+            leftover = first
+
+        # ── connect to sshd (retry once on transient failure) ────────────
+        ssh_reader = ssh_writer = None
+        for attempt in range(2):
+            try:
+                ssh_reader, ssh_writer = await asyncio.wait_for(
+                    asyncio.open_connection("127.0.0.1", SSH_PORT), timeout=5
+                )
+                break
+            except Exception as e:
+                if attempt == 0:
+                    await asyncio.sleep(0.5)
+                else:
+                    log.warning("sshd connect failed for %s: %s", client_ip, e)
+                    return
+
+        local_port = ssh_writer.get_extra_info("sockname")[1]
+        await _register(local_port, client_ip)
+
+        if leftover:
+            try:
+                ssh_writer.write(leftover)
+                await ssh_writer.drain()
+            except Exception:
+                return
+
+        # ── bidirectional relay ──────────────────────────────────────────
         await asyncio.gather(
-            _relay(client_reader, ssh_writer),
-            _relay(ssh_reader, client_writer),
+            _relay(client_reader, ssh_writer, "c→s"),
+            _relay(ssh_reader,   client_writer, "s→c"),
         )
+
+    except Exception as e:
+        log.debug("handle_client %s: %s", client_ip, e)
     finally:
-        await _unregister(local_port)
-        for w in (client_writer, ssh_writer):
+        if local_port is not None:
+            await _unregister(local_port)
+        for w in [client_writer] + ([ssh_writer] if 'ssh_writer' in dir() and ssh_writer else []):
             try:
                 w.close()
+                await w.wait_closed()
             except Exception:
                 pass
 
 
+# ── main ──────────────────────────────────────────────────────────────────────
+
 async def main():
+    global _shutdown
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     if not os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "w") as f:
-            json.dump({}, f)
+        _save_state_sync({})
 
-    server = await asyncio.start_server(handle_client, "0.0.0.0", WS_PORT)
-    print(f"[ws-proxy] listening on 0.0.0.0:{WS_PORT} -> 127.0.0.1:{SSH_PORT}")
+    loop = asyncio.get_running_loop()
+
+    def _on_signal():
+        global _shutdown
+        _shutdown = True
+        log.info("shutdown signal received")
+        loop.stop()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _on_signal)
+        except NotImplementedError:
+            pass  # Windows
+
+    # SO_REUSEADDR + SO_REUSEPORT via reuse_port=True
+    try:
+        server = await asyncio.start_server(
+            handle_client, "0.0.0.0", WS_PORT,
+            reuse_address=True,
+            reuse_port=True,
+        )
+    except OSError as e:
+        log.error("cannot bind port %d: %s", WS_PORT, e)
+        sys.exit(1)
+
+    asyncio.ensure_future(_gc_state())
+
+    addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
+    log.info("listening on %s  →  127.0.0.1:%d", addrs, SSH_PORT)
+
     async with server:
         await server.serve_forever()
+
+    # cleanup on shutdown
+    _save_state_sync({})
+    log.info("state file cleared, exiting")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        sys.exit(0)
+    except (KeyboardInterrupt, SystemExit):
+        pass
 
 PYEOF
 chmod +x /usr/local/bin/ws-proxy.py
@@ -259,6 +351,8 @@ renew_user() {
 check_online() {
     printf "%-18s %-6s %-6s %s\n" "USERNAME" "ONLINE" "LIMIT" "IP LIST"
     echo "------------------------------------------------------------"
+    local now
+    now=$(date +%s)
     for f in "$LIMIT_DIR"/*; do
         [[ -e "$f" ]] || continue
         user=$(basename "$f")
@@ -270,13 +364,26 @@ check_online() {
                 '.[$u]? // [] | [.[].ip] | join(", ")' "$ONLINE_FILE" 2>/dev/null)
             [[ -z "$ip_list" ]] && ip_list="-"
         fi
-        printf "%-18s %-6s %-6s %s\n" "$user" "$online" "$limit" "$ip_list"
+        # Check expired
+        exp=$(chage -l "$user" 2>/dev/null | awk -F': ' '/Account expires/{print $2}')
+        expired=0
+        if [[ "$exp" != "-" && "$exp" != "never" && -n "$exp" ]]; then
+            exp_epoch=$(date -d "$exp" +%s 2>/dev/null) || exp_epoch=0
+            (( exp_epoch > 0 && exp_epoch <= now )) && expired=1
+        fi
+        if (( expired )); then
+            printf "${RED}%-18s %-6s %-6s %s  [EXPIRED]${NC}\n" "$user" "$online" "$limit" "$ip_list"
+        else
+            printf "%-18s %-6s %-6s %s\n" "$user" "$online" "$limit" "$ip_list"
+        fi
     done
 }
 
 user_info_list() {
     printf "%-14s %-14s %-12s %-8s\n" "USERNAME" "PASSWORD" "EXPIRE" "ONLINE"
     echo "--------------------------------------------------------"
+    local now
+    now=$(date +%s)
     for f in "$LIMIT_DIR"/*; do
         [[ -e "$f" ]] || continue
         user=$(basename "$f")
@@ -284,7 +391,17 @@ user_info_list() {
         exp=$(chage -l "$user" 2>/dev/null | awk -F': ' '/Account expires/{print $2}')
         [[ -z "$exp" ]] && exp="-"
         online=$(ps aux | grep "sshd: $user" | grep -v grep | grep -v "\[priv\]" | wc -l)
-        printf "%-14s %-14s %-12s %-8s\n" "$user" "$pass" "$exp" "$online"
+        # Check if expired
+        expired=0
+        if [[ "$exp" != "-" && "$exp" != "never" ]]; then
+            exp_epoch=$(date -d "$exp" +%s 2>/dev/null) || exp_epoch=0
+            (( exp_epoch > 0 && exp_epoch <= now )) && expired=1
+        fi
+        if (( expired )); then
+            printf "${RED}%-14s %-14s %-12s %-8s  [EXPIRED]${NC}\n" "$user" "$pass" "$exp" "$online"
+        else
+            printf "%-14s %-14s %-12s %-8s\n" "$user" "$pass" "$exp" "$online"
+        fi
     done
 }
 
@@ -372,7 +489,7 @@ cat <<'LIMEOF' > /usr/local/bin/limiter.sh
 LIMIT_DIR="/etc/ws-ssh/limit"
 STATE_FILE="/var/run/ws-ssh/active_conns.json"
 ONLINE_FILE="/var/run/ws-ssh/online_ips.json"
-POLL_SECONDS="${POLL_SECONDS:-3}"
+
 
 mkdir -p "$LIMIT_DIR" "$(dirname "$STATE_FILE")"
 
