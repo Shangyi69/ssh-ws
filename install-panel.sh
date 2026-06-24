@@ -30,6 +30,8 @@ import os
 import re
 import secrets
 import subprocess
+import threading
+import time
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -162,6 +164,13 @@ def user_exists(user):
     return subprocess.run(["id", user], capture_output=True).returncode == 0
 
 
+def kick_user(user):
+    """Forcefully disconnect ALL sessions for a user — the exact same action
+    as clicking 'Kick' in the dashboard. Shared by the manual API route and
+    the automatic background enforcer below."""
+    subprocess.run(["pkill", "-9", "-u", user])
+
+
 def list_users():
     ensure_dirs()
     rows = []
@@ -289,7 +298,7 @@ def api_kick():
     user = (data.get("username") or "").strip()
     if not USERNAME_RE.match(user) or not user_exists(user):
         return jsonify(ok=False, error="User မရှိပါ"), 400
-    subprocess.run(["pkill", "-9", "-u", user])
+    kick_user(user)
     return jsonify(ok=True)
 
 
@@ -346,9 +355,35 @@ def api_changepassword():
 
 app.secret_key = get_secret_key()
 
+# ---------------------------------------------------- auto-kick enforcer ----
+# Runs in the background for as long as the panel process is alive (the
+# systemd service keeps the panel running 24/7 with Restart=always).
+# Every AUTO_KICK_INTERVAL seconds it checks each managed user's online
+# session count against their device limit. If a user is OVER their limit,
+# it performs the exact same action as clicking "Kick" in the dashboard —
+# no manual click needed.
+AUTO_KICK_INTERVAL = int(os.environ.get("AUTO_KICK_INTERVAL", "5"))
+
+
+def auto_kick_enforcer():
+    while True:
+        try:
+            for u in list_users():
+                try:
+                    limit = int(u["limit"])
+                except (TypeError, ValueError):
+                    continue
+                if u["online"] > limit:
+                    kick_user(u["username"])
+        except Exception:
+            pass
+        time.sleep(AUTO_KICK_INTERVAL)
+
+
 if __name__ == "__main__":
     ensure_dirs()
     load_auth()
+    threading.Thread(target=auto_kick_enforcer, daemon=True).start()
     port = int(os.environ.get("PANEL_PORT", "2053"))
     app.run(host="0.0.0.0", port=port)
 
