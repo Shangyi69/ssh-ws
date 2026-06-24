@@ -183,16 +183,13 @@ cat <<'MENUEOF' > /usr/local/bin/menu
 # menu - SSH+WebSocket account management
 LIMIT_DIR="/etc/ws-ssh/limit"
 INFO_DIR="/etc/ws-ssh/info"
-BANLOG="/etc/ws-ssh/banned_ips.list"
+ONLINE_FILE="/var/run/ws-ssh/online_ips.json"
 GREEN='\033[1;32m'; RED='\033[1;31m'; YELLOW='\033[1;33m'; CYAN='\033[1;36m'; NC='\033[0m'
 
 mkdir -p "$LIMIT_DIR" "$INFO_DIR"
-touch "$BANLOG"
 
 pause() { read -rp "Enter ဖိ၍ menu သို့ ပြန်သွားရန်..." _; }
 
-# Lists managed usernames with numbers (to stderr), reads a selection,
-# echoes the chosen username to stdout (so callers do: user=$(select_user)).
 select_user() {
     mapfile -t users < <(ls "$LIMIT_DIR" 2>/dev/null | sort)
     if [[ ${#users[@]} -eq 0 ]]; then
@@ -260,7 +257,6 @@ renew_user() {
 }
 
 check_online() {
-    ONLINE_FILE="/var/run/ws-ssh/online_ips.json"
     printf "%-18s %-6s %-6s %s\n" "USERNAME" "ONLINE" "LIMIT" "IP LIST"
     echo "------------------------------------------------------------"
     for f in "$LIMIT_DIR"/*; do
@@ -268,10 +264,10 @@ check_online() {
         user=$(basename "$f")
         limit=$(cat "$f")
         online=$(ps aux | grep "sshd: $user" | grep -v grep | grep -v "\[priv\]" | wc -l)
-        # Real IP list from limiter's online_ips.json
         ip_list="-"
         if [[ -f "$ONLINE_FILE" ]]; then
-            ip_list=$(jq -r --arg u "$user" '.[$u]? // [] | [.[].ip] | join(", ")' "$ONLINE_FILE" 2>/dev/null)
+            ip_list=$(jq -r --arg u "$user" \
+                '.[$u]? // [] | [.[].ip] | join(", ")' "$ONLINE_FILE" 2>/dev/null)
             [[ -z "$ip_list" ]] && ip_list="-"
         fi
         printf "%-18s %-6s %-6s %s\n" "$user" "$online" "$limit" "$ip_list"
@@ -284,9 +280,8 @@ user_info_list() {
     for f in "$LIMIT_DIR"/*; do
         [[ -e "$f" ]] || continue
         user=$(basename "$f")
-        pass=$(cat "$INFO_DIR/$user" 2>/dev/null)
-        [[ -z "$pass" ]] && pass="-"
-        exp=$(chage -l "$user" 2>/dev/null | awk -F': ' '/Account expires/ {print $2}')
+        pass=$(cat "$INFO_DIR/$user" 2>/dev/null); [[ -z "$pass" ]] && pass="-"
+        exp=$(chage -l "$user" 2>/dev/null | awk -F': ' '/Account expires/{print $2}')
         [[ -z "$exp" ]] && exp="-"
         online=$(ps aux | grep "sshd: $user" | grep -v grep | grep -v "\[priv\]" | wc -l)
         printf "%-14s %-14s %-12s %-8s\n" "$user" "$pass" "$exp" "$online"
@@ -303,7 +298,7 @@ check_usage() {
         gb=$(awk -v b="$bytes" 'BEGIN { printf "%.3f", b/1024/1024/1024 }')
         printf "%-18s %-12s\n" "$user" "$gb"
     done
-    echo -e "${YELLOW}[note] Output (server->client) traffic ကိုသာ count ထားသည် (rough estimate)${NC}"
+    echo -e "${YELLOW}[note] Output traffic ကိုသာ count ထားသည်${NC}"
 }
 
 set_limit() {
@@ -318,16 +313,11 @@ set_limit() {
     echo -e "${GREEN}[+] '$user' limit -> $newlimit${NC}"
 }
 
-list_banned() {
-    echo -e "${CYAN}Banned IP list:${NC}"
-    if [[ -s "$BANLOG" ]]; then cat "$BANLOG"; else echo "(empty)"; fi
-}
-
-unban_ip() {
-    read -rp "Unban မည့် IP: " ip
-    iptables -D INPUT -s "$ip" -j DROP 2>/dev/null
-    sed -i "\|^$ip\$|d" "$BANLOG"
-    echo -e "${GREEN}[+] $ip ကို unban ပြီးပါပြီ${NC}"
+kick_user() {
+    user=$(select_user) || return
+    [[ -z "$user" ]] && return
+    pkill -9 -u "$user" 2>/dev/null
+    echo -e "${GREEN}[+] '$user' ရဲ့ session အားလုံး kick ပြီးပါပြီ${NC}"
 }
 
 while true; do
@@ -338,15 +328,14 @@ while true; do
     echo " 1) Create User"
     echo " 2) Delete User"
     echo " 3) Renew User"
-    echo " 4) User Info List (username/password/expire/online)"
-    echo " 5) Check Online"
+    echo " 4) User Info List"
+    echo " 5) Check Online + IP List"
     echo " 6) Check Data Usage (GB)"
     echo " 7) Set/Check Device Limit"
-    echo " 8) Banned IP list"
-    echo " 9) Unban IP"
+    echo " 8) Kick User (force disconnect all sessions)"
     echo " 0) Exit"
     echo -e "${CYAN}=========================================${NC}"
-    read -rp "ရွေးပါ [0-9]: " opt
+    read -rp "ရွေးပါ [0-8]: " opt
     echo
     case "$opt" in
         1) create_user ;;
@@ -356,8 +345,7 @@ while true; do
         5) check_online ;;
         6) check_usage ;;
         7) set_limit ;;
-        8) list_banned ;;
-        9) unban_ip ;;
+        8) kick_user ;;
         0) exit 0 ;;
         *) echo -e "${RED}မှားနေပါသည်${NC}" ;;
     esac
@@ -372,56 +360,35 @@ ln -sf /usr/local/bin/menu /usr/bin/menu
 echo -e "${YELLOW}[*] writing limiter.sh ...${NC}"
 cat <<'LIMEOF' > /usr/local/bin/limiter.sh
 #!/bin/bash
-# limiter.sh - daemon: device-limit + expiry + auto-ban
-# Architecture:
-#   ws-proxy.py stores real client IPs in STATE_FILE keyed by
-#   the local ephemeral port it used to connect to sshd:22.
-#   ss -tnp sport=:22 shows those connections as 127.0.0.1:EPORT -> 127.0.0.1:22
-#   We look up EPORT in STATE_FILE to recover the real client IP.
+# limiter.sh - daemon: device-limit enforcer + expiry killer
 #
-# ONLINE_FILE: /var/run/ws-ssh/online_ips.json
-#   Written each poll cycle so the web panel can display real IPs.
-#   Format: {"username": [{"ip":"x.x.x.x","pid":1234,"ts":1234567890}, ...]}
+# Strategy: NO IP ban. Instead, keep the OLDEST session(s) up to the
+# configured limit and immediately kill any newer excess connections.
+# Result: existing session stays stable; new connection gets dropped.
+#
+# online_ips.json is written every poll cycle for the web panel.
+# Format: {"username": [{"ip":"x.x.x.x","pid":1234,"ts":1234567890}, ...]}
 
 LIMIT_DIR="/etc/ws-ssh/limit"
 STATE_FILE="/var/run/ws-ssh/active_conns.json"
 ONLINE_FILE="/var/run/ws-ssh/online_ips.json"
-BANLOG="/etc/ws-ssh/banned_ips.list"
-POLL_SECONDS="${POLL_SECONDS:-5}"
+POLL_SECONDS="${POLL_SECONDS:-3}"
 
 mkdir -p "$LIMIT_DIR" "$(dirname "$STATE_FILE")"
-touch "$BANLOG"
-
-is_banned() {
-    grep -qxF "$1" "$BANLOG" 2>/dev/null
-}
-
-ban_ip() {
-    local ip="$1"
-    # Only skip empty or truly unresolvable
-    [[ -z "$ip" || "$ip" == "unknown" ]] && return
-    if ! is_banned "$ip"; then
-        iptables -I INPUT -s "$ip" -j DROP 2>/dev/null
-        echo "$ip" >> "$BANLOG"
-        logger -t ws-ssh-limiter "banned IP $ip (device limit exceeded)"
-    fi
-}
 
 kill_expired() {
     [[ -d "$LIMIT_DIR" ]] || return
-    local now
+    local now user exp_str exp_epoch
     now=$(date +%s)
     for f in "$LIMIT_DIR"/*; do
         [[ -e "$f" ]] || continue
-        local user exp_str exp_epoch
         user=$(basename "$f")
-        exp_str=$(chage -l "$user" 2>/dev/null | awk -F': ' '/Account expires/ {print $2}')
+        exp_str=$(chage -l "$user" 2>/dev/null | awk -F': ' '/Account expires/{print $2}')
         [[ -z "$exp_str" || "$exp_str" == "never" ]] && continue
         exp_epoch=$(date -d "$exp_str" +%s 2>/dev/null) || continue
         if (( exp_epoch <= now )); then
-            if pkill -9 -u "$user" 2>/dev/null; then
-                logger -t ws-ssh-limiter "user=$user expired ($exp_str) -> disconnected"
-            fi
+            pkill -9 -u "$user" 2>/dev/null && \
+                logger -t ws-ssh-limiter "user=$user expired -> disconnected"
         fi
     done
 }
@@ -429,82 +396,75 @@ kill_expired() {
 one_pass() {
     [[ -d "$LIMIT_DIR" ]] || return
 
-    # Build per-user session list: user -> array of "pid|ts|ip"
-    declare -A sessions
+    declare -A sessions   # user -> newline-separated "ts|pid|ip" entries
 
-    # ss output for established conns on port 22
-    # Format: ESTAB  0  0  127.0.0.1:22  127.0.0.1:EPORT  users:(("sshd",pid=NNN,...))
+    # Parse: ESTAB 0 0 127.0.0.1:22  127.0.0.1:EPORT  users:(("sshd",pid=NNN,...))
     while IFS= read -r line; do
         local_addr=$(awk '{print $4}' <<< "$line")
-        peer_addr=$(awk '{print $5}' <<< "$line")
-
-        # Only care about sshd side (local port 22)
+        peer_addr=$(awk '{print $5}'  <<< "$line")
         [[ "$local_addr" == *:22 ]] || continue
 
-        # Ephemeral port ws-proxy used — this is the STATE_FILE lookup key
         eport="${peer_addr##*:}"
         [[ "$eport" =~ ^[0-9]+$ ]] || continue
 
-        # Extract sshd pid
         pid=$(grep -oP 'pid=\K[0-9]+' <<< "$line" | head -1)
         [[ -z "$pid" ]] && continue
 
-        # Get the OS user running this sshd child
         user=$(ps -o user= -p "$pid" 2>/dev/null | tr -d '[:space:]')
         [[ -z "$user" ]] && continue
         [[ -f "$LIMIT_DIR/$user" ]] || continue
 
-        # Lookup real client IP and connect timestamp from ws-proxy state
-        real_ip="unknown"
-        ts="0"
+        # Real client IP + connect time from ws-proxy state file
+        real_ip="unknown"; ts="0"
         if [[ -f "$STATE_FILE" ]]; then
             real_ip=$(jq -r --arg p "$eport" '.[$p].ip // "unknown"' "$STATE_FILE" 2>/dev/null)
-            ts=$(jq -r --arg p "$eport" '.[$p].ts // 0' "$STATE_FILE" 2>/dev/null)
-            # Fallback: if lookup gave empty string
+            ts=$(jq -r       --arg p "$eport" '.[$p].ts // 0'       "$STATE_FILE" 2>/dev/null)
             [[ -z "$real_ip" ]] && real_ip="unknown"
         fi
 
-        sessions["$user"]+="${pid}|${ts}|${real_ip}"$'\n'
+        sessions["$user"]+="${ts}|${pid}|${real_ip}"$'\n'
     done < <(ss -H -tnp state established '( sport = :22 )' 2>/dev/null)
 
-    # Write online_ips.json for the web panel
+    # ── Write online_ips.json (for panel / menu) ─────────────────────────
     {
-        echo "{"
-        local first_user=1
+        printf '{\n'
+        local comma=0
         for user in "${!sessions[@]}"; do
-            [[ $first_user -eq 0 ]] && echo ","
-            first_user=0
-            echo "  \"$user\": ["
-            local first_entry=1
+            [[ $comma -eq 1 ]] && printf ',\n'
+            comma=1
+            printf '  "%s": [\n' "$user"
+            local cfirst=1
             while IFS= read -r entry; do
                 [[ -z "$entry" ]] && continue
-                IFS='|' read -r pid ts ip <<< "$entry"
-                [[ $first_entry -eq 0 ]] && echo ","
-                first_entry=0
+                IFS='|' read -r ts pid ip <<< "$entry"
+                [[ $cfirst -eq 0 ]] && printf ',\n'
+                cfirst=0
                 printf '    {"ip":"%s","pid":%s,"ts":%s}' "$ip" "$pid" "$ts"
             done <<< "${sessions[$user]}"
-            echo ""
-            echo "  ]"
+            printf '\n  ]'
         done
-        echo "}"
+        printf '\n}\n'
     } > "${ONLINE_FILE}.tmp" 2>/dev/null && mv "${ONLINE_FILE}.tmp" "$ONLINE_FILE"
 
-    # Enforce device limits
+    # ── Enforce limits: keep oldest, kill newest ──────────────────────────
     for user in "${!sessions[@]}"; do
         limit=$(cat "$LIMIT_DIR/$user" 2>/dev/null)
         [[ "$limit" =~ ^[0-9]+$ ]] || continue
 
-        # Sort by timestamp ascending (oldest first), kill newest excess
-        mapfile -t lines < <(printf '%s' "${sessions[$user]}" | grep -v '^$' | sort -t'|' -k2 -n)
+        # Sort ascending by timestamp → oldest first
+        mapfile -t lines < <(
+            printf '%s' "${sessions[$user]}" | grep -v '^$' | sort -t'|' -k1 -n
+        )
         count=${#lines[@]}
-        [[ "$count" -le "$limit" ]] && continue
+        [[ $count -le $limit ]] && continue
 
-        excess=$(( count - limit ))
-        for (( i = count - excess; i < count; i++ )); do
-            IFS='|' read -r pid ts ip <<< "${lines[$i]}"
-            kill -9 "$pid" 2>/dev/null && \
-                logger -t ws-ssh-limiter "user=$user limit=$limit count=$count -> killed pid=$pid ip=$ip"
-            ban_ip "$ip"
+        # Kill lines[$limit]..lines[$count-1]  (newest excess)
+        for (( i = limit; i < count; i++ )); do
+            IFS='|' read -r ts pid ip <<< "${lines[$i]}"
+            if kill -9 "$pid" 2>/dev/null; then
+                logger -t ws-ssh-limiter \
+                    "user=$user limit=$limit count=$count -> killed newest pid=$pid ip=$ip"
+            fi
         done
     done
 }

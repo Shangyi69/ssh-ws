@@ -276,6 +276,17 @@ def api_delete():
     return jsonify(ok=True)
 
 
+@app.route("/api/kick", methods=["POST"])
+@login_required
+def api_kick():
+    data = request.get_json(force=True) or {}
+    user = (data.get("username") or "").strip()
+    if not USERNAME_RE.match(user) or not user_exists(user):
+        return jsonify(ok=False, error="User မရှိပါ"), 400
+    subprocess.run(["pkill", "-9", "-u", user])
+    return jsonify(ok=True)
+
+
 @app.route("/api/renew", methods=["POST"])
 @login_required
 def api_renew():
@@ -309,22 +320,6 @@ def api_setlimit():
         return jsonify(ok=False, error="limit must be a number"), 400
     with open(os.path.join(LIMIT_DIR, user), "w") as f:
         f.write(str(limit))
-    return jsonify(ok=True)
-
-
-@app.route("/api/unban", methods=["POST"])
-@login_required
-def api_unban():
-    data = request.get_json(force=True) or {}
-    ip = (data.get("ip") or "").strip()
-    if not ip:
-        return jsonify(ok=False, error="ip required"), 400
-    subprocess.run(["iptables", "-D", "INPUT", "-s", ip, "-j", "DROP"])
-    ensure_dirs()
-    with open(BANLOG) as f:
-        lines = [l.strip() for l in f if l.strip() and l.strip() != ip]
-    with open(BANLOG, "w") as f:
-        f.write("\n".join(lines) + ("\n" if lines else ""))
     return jsonify(ok=True)
 
 
@@ -551,6 +546,7 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
             <div class="actions">
               <button class="btn small" onclick="openRenew('{{ u.username }}')">Renew</button>
               <button class="btn ghost small" onclick="openLimit('{{ u.username }}','{{ u.limit }}')">Limit</button>
+              <button class="btn small" style="background:var(--yellow);color:#000" onclick="doKick('{{ u.username }}')">Kick</button>
               <button class="btn red small" onclick="doDelete('{{ u.username }}')">Delete</button>
             </div>
           </td>
@@ -559,11 +555,7 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
       </tbody>
     </table>
 
-    <div class="card">
-      <h2>Banned IPs</h2>
-      <div class="iplist" id="bannedList"><span class="muted">loading...</span></div>
-    </div>
-  </main>
+    </main>
 
   <!-- Create modal -->
   <div class="overlay" id="createModal">
@@ -683,6 +675,13 @@ async function doLimit(){
   else { msg.textContent = data.error || 'Error'; msg.className = 'msg err'; }
 }
 
+async function doKick(user){
+  if(!confirm(`'${user}' ရဲ့ session အားလုံး disconnect မှာ သေချာပါသလား?`)) return;
+  const {data} = await api('/api/kick', {username:user});
+  if(data.ok){ location.reload(); }
+  else { alert(data.error || 'Error'); }
+}
+
 async function doDelete(user){
   if(!confirm(`'${user}' ကို ဖျက်မှာ သေချာပါသလား?`)) return;
   const {data} = await api('/api/delete', {username:user});
@@ -700,28 +699,6 @@ async function doChangePassword(){
   if(data.ok){ alert('Password ပြောင်းပြီးပါပြီ - ပြန် login ဝင်ပါ'); location.href='/logout'; }
   else { msg.textContent = data.error || 'Error'; msg.className = 'msg err'; }
 }
-
-async function loadBanned(){
-  const res = await fetch('/api/banned');
-  const data = await res.json();
-  const el = document.getElementById('bannedList');
-  if(!data.ips || data.ips.length === 0){
-    el.innerHTML = '<span class="muted">(empty)</span>';
-    return;
-  }
-  el.innerHTML = '';
-  data.ips.forEach(ip=>{
-    const chip = document.createElement('div');
-    chip.className = 'ipchip';
-    chip.innerHTML = `<span>${ip}</span><button onclick="unban('${ip}')">unban</button>`;
-    el.appendChild(chip);
-  });
-}
-async function unban(ip){
-  await api('/api/unban', {ip});
-  loadBanned();
-}
-loadBanned();
 </script>
 </body>
 </html>
