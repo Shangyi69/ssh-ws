@@ -18,9 +18,16 @@ else
 fi
 [[ -z "$WS_PORT" ]] && { echo -e "${RED}[x] port ထည့်ပါ${NC}"; exit 1; }
 
+if [[ -n "$2" ]]; then
+    SSL_PORT="$2"
+else
+    read -rp "SSH+SSL (TLS) port ဘယ်ဟာသုံးမလဲ (e.g. 443, blank = skip): " SSL_PORT
+fi
+
 echo -e "${YELLOW}[*] Package update / install...${NC}"
 apt update -y
 apt install -y openssh-server python3 iptables jq net-tools iproute2 cron >/dev/null
+[[ -n "$SSL_PORT" ]] && apt install -y stunnel4 openssl >/dev/null
 
 echo -e "${YELLOW}[*] sshd config...${NC}"
 sed -i 's/^#\?AllowTcpForwarding.*/AllowTcpForwarding yes/' /etc/ssh/sshd_config
@@ -616,6 +623,52 @@ RuntimeDirectory=ws-ssh
 WantedBy=multi-user.target
 EOF
 
+if [[ -n "$SSL_PORT" ]]; then
+    echo -e "${YELLOW}[*] SSH+SSL (stunnel) setup on port ${SSL_PORT} -> 127.0.0.1:${WS_PORT} ...${NC}"
+
+    mkdir -p /etc/stunnel
+
+    if [[ ! -f /etc/stunnel/stunnel.pem ]]; then
+        openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+            -keyout /etc/stunnel/stunnel.key -out /etc/stunnel/stunnel.crt \
+            -subj "/C=US/ST=NA/L=NA/O=SSH-WS/CN=$(hostname -f 2>/dev/null || hostname)" \
+            >/dev/null 2>&1
+        cat /etc/stunnel/stunnel.key /etc/stunnel/stunnel.crt > /etc/stunnel/stunnel.pem
+        chmod 600 /etc/stunnel/stunnel.pem
+    fi
+
+    cat <<EOF > /etc/stunnel/ws-ssl.conf
+pid = /var/run/stunnel-ws-ssl.pid
+cert = /etc/stunnel/stunnel.pem
+client = no
+[ssh-ssl]
+accept = ${SSL_PORT}
+connect = 127.0.0.1:${WS_PORT}
+EOF
+
+    cat <<EOF > /etc/systemd/system/ws-ssl.service
+[Unit]
+Description=SSH+SSL (stunnel) wrapper for SSH-WS
+After=network.target ws-proxy.service
+Requires=ws-proxy.service
+
+[Service]
+ExecStart=/usr/bin/stunnel4 /etc/stunnel/ws-ssl.conf
+Restart=always
+RuntimeDirectory=stunnel-ws-ssl
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now ws-ssl.service
+
+    if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
+        ufw allow "${SSL_PORT}"/tcp
+    fi
+fi
+
 cat <<'EOF' > /etc/systemd/system/ws-limiter.service
 [Unit]
 Description=SSH-WS per-user device limiter / expiry enforcer
@@ -641,5 +694,8 @@ fi
 echo -e "${GREEN}=========================================${NC}"
 echo -e "${GREEN}  Install ပြီးပါပြီ!${NC}"
 echo -e "${GREEN}  WebSocket port : ${WS_PORT}${NC}"
+if [[ -n "$SSL_PORT" ]]; then
+    echo -e "${GREEN}  SSH+SSL port   : ${SSL_PORT}${NC}"
+fi
 echo -e "${GREEN}  Menu command   : menu${NC}"
 echo -e "${GREEN}=========================================${NC}"
