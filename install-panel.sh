@@ -14,7 +14,7 @@ PANEL_PORT="${1:-2053}"
 echo -e "${YELLOW}[*] Package install...${NC}"
 apt update -y
 apt install -y python3 python3-pip >/dev/null
-pip3 install -q flask werkzeug --break-system-packages 2>/dev/null || pip3 install -q flask werkzeug
+pip3 install -q flask werkzeug psutil --break-system-packages 2>/dev/null || pip3 install -q flask werkzeug psutil
 
 mkdir -p /opt/ws-panel/templates /etc/ws-ssh/panel /etc/ws-ssh/limit /etc/ws-ssh/info
 
@@ -29,6 +29,8 @@ import json
 import os
 import re
 import secrets
+import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -38,6 +40,11 @@ from functools import wraps
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 LIMIT_DIR = "/etc/ws-ssh/limit"
 INFO_DIR = "/etc/ws-ssh/info"
 PANEL_DIR = "/etc/ws-ssh/panel"
@@ -45,6 +52,18 @@ AUTH_FILE = os.path.join(PANEL_DIR, "auth.json")
 SECRET_FILE = os.path.join(PANEL_DIR, "secret.key")
 
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
+
+# Services / ports this panel keeps an eye on. "port" is used for a raw TCP
+# reachability check (works even if the process isn't a systemd unit, e.g.
+# stunnel might be skipped during install); "service" is the systemd unit
+# name used to get a proper active/inactive verdict when available.
+WATCHED_SERVICES = [
+    {"key": "ssh", "label": "SSH (22)", "port": 22, "service": "ssh"},
+    {"key": "ssh_alt", "label": "SSH (22) [sshd]", "port": 22, "service": "sshd"},
+    {"key": "ws_proxy", "label": "SSH+WS", "port": int(os.environ.get("WS_PORT", "8880")), "service": "ws-proxy"},
+    {"key": "ws_ssl", "label": "SSH+SSL (443)", "port": int(os.environ.get("SSL_PORT", "443")), "service": "ws-ssl"},
+    {"key": "ws_limiter", "label": "Limiter", "port": None, "service": "ws-limiter"},
+]
 
 app = Flask(__name__)
 
@@ -144,20 +163,104 @@ def get_online_ips(user):
         return []
 
 
-def get_usage_gb(user):
+# --------------------------------------------------------------- traffic ----
+# Per-user traffic is tagged in iptables with a comment so we can find it
+# again: "wsdata-{user}-out" for upload (server -> client, OUTPUT chain) and
+# "wsdata-{user}-in" for download (client -> server, INPUT chain). Older
+# installs only ever created the "-out"-less legacy rule
+# ("wsdata-{user}", no suffix) which is upload-only, so both the legacy tag
+# and the new tags are recognised for backward compatibility.
+
+def _uid_of(user):
+    try:
+        return subprocess.run(["id", "-u", user], capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return ""
+
+
+def ensure_traffic_rules(user):
+    """Make sure both the OUTPUT (upload) and INPUT (download) counters
+    exist for a user. Safe to call repeatedly (checks -C before -A) so it
+    can be used both at user-creation time and as a one-off backfill for
+    users created by an older version of this panel that only had the
+    OUTPUT rule."""
+    uid = _uid_of(user)
+    if not uid:
+        return
+    rules = [
+        ("OUTPUT", f"wsdata-{user}-out"),
+        ("INPUT", f"wsdata-{user}-in"),
+    ]
+    for chain, comment in rules:
+        check = subprocess.run(
+            ["iptables", "-C", chain, "-m", "owner", "--uid-owner", uid, "-m", "comment", "--comment", comment, "-j", "ACCEPT"],
+            capture_output=True,
+        )
+        if check.returncode != 0:
+            subprocess.run(
+                ["iptables", "-A", chain, "-m", "owner", "--uid-owner", uid, "-m", "comment", "--comment", comment, "-j", "ACCEPT"],
+                capture_output=True,
+            )
+
+
+def remove_traffic_rules(user, uid):
+    """Delete both directions' counters plus the legacy no-suffix rule."""
+    if not uid:
+        return
+    targets = [
+        ("OUTPUT", f"wsdata-{user}-out"),
+        ("INPUT", f"wsdata-{user}-in"),
+        ("OUTPUT", f"wsdata-{user}"),  # legacy upload-only rule
+    ]
+    for chain, comment in targets:
+        subprocess.run(
+            ["iptables", "-D", chain, "-m", "owner", "--uid-owner", uid, "-m", "comment", "--comment", comment, "-j", "ACCEPT"],
+            capture_output=True,
+        )
+
+
+def _chain_bytes(chain, comment):
     try:
         out = subprocess.run(
-            ["iptables", "-L", "OUTPUT", "-v", "-n", "-x"], capture_output=True, text=True, timeout=5
+            ["iptables", "-L", chain, "-v", "-n", "-x"], capture_output=True, text=True, timeout=5
         ).stdout
         total = 0
         for line in out.splitlines():
-            if f"wsdata-{user}" in line:
+            if comment in line:
                 parts = line.split()
                 if len(parts) > 1 and parts[1].isdigit():
                     total += int(parts[1])
-        return round(total / 1024 / 1024 / 1024, 3)
+        return total
     except Exception:
-        return 0.0
+        return 0
+
+
+def get_usage_gb(user):
+    """Total traffic (upload + download) for a user, in GB.
+
+    Upload  = OUTPUT chain, comment wsdata-{user}-out (new) or
+              wsdata-{user} (legacy, upload-only rule from older installs).
+    Download = INPUT chain, comment wsdata-{user}-in.
+    """
+    upload_bytes = _chain_bytes("OUTPUT", f"wsdata-{user}-out")
+    if upload_bytes == 0:
+        # fall back to the legacy untagged-direction rule so existing
+        # installs don't suddenly show 0 usage after upgrading the panel
+        upload_bytes = _chain_bytes("OUTPUT", f"wsdata-{user}")
+    download_bytes = _chain_bytes("INPUT", f"wsdata-{user}-in")
+    total = upload_bytes + download_bytes
+    return round(total / 1024 / 1024 / 1024, 3)
+
+
+def get_usage_detail_gb(user):
+    """Same as get_usage_gb but broken out by direction, for a detail view."""
+    upload_bytes = _chain_bytes("OUTPUT", f"wsdata-{user}-out") or _chain_bytes("OUTPUT", f"wsdata-{user}")
+    download_bytes = _chain_bytes("INPUT", f"wsdata-{user}-in")
+    return {
+        "upload_gb": round(upload_bytes / 1024 / 1024 / 1024, 3),
+        "download_gb": round(download_bytes / 1024 / 1024 / 1024, 3),
+        "total_gb": round((upload_bytes + download_bytes) / 1024 / 1024 / 1024, 3),
+    }
 
 
 def user_exists(user):
@@ -200,6 +303,148 @@ def list_users():
     return rows
 
 
+# ------------------------------------------------------- system monitor ----
+
+def get_system_stats():
+    """CPU / RAM / Disk usage as percentages, plus a couple of raw figures
+    for context. Uses psutil when it's available (installed by the panel's
+    installer); falls back to /proc and shutil.disk_usage otherwise so the
+    dashboard still works on a minimal box without the dependency."""
+    stats = {"cpu_percent": 0.0, "ram_percent": 0.0, "ram_used_gb": 0.0, "ram_total_gb": 0.0,
+             "disk_percent": 0.0, "disk_used_gb": 0.0, "disk_total_gb": 0.0}
+
+    if psutil is not None:
+        try:
+            stats["cpu_percent"] = round(psutil.cpu_percent(interval=0.3), 1)
+        except Exception:
+            pass
+        try:
+            vm = psutil.virtual_memory()
+            stats["ram_percent"] = round(vm.percent, 1)
+            stats["ram_used_gb"] = round(vm.used / 1024 / 1024 / 1024, 2)
+            stats["ram_total_gb"] = round(vm.total / 1024 / 1024 / 1024, 2)
+        except Exception:
+            pass
+        try:
+            du = psutil.disk_usage("/")
+            stats["disk_percent"] = round(du.percent, 1)
+            stats["disk_used_gb"] = round(du.used / 1024 / 1024 / 1024, 2)
+            stats["disk_total_gb"] = round(du.total / 1024 / 1024 / 1024, 2)
+        except Exception:
+            pass
+        return stats
+
+    # ---- fallback path (no psutil) ----
+    try:
+        with open("/proc/loadavg") as f:
+            load1 = float(f.read().split()[0])
+        cores = os.cpu_count() or 1
+        stats["cpu_percent"] = round(min(load1 / cores * 100, 100), 1)
+    except Exception:
+        pass
+    try:
+        meminfo = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                meminfo[k.strip()] = int(v.strip().split()[0])  # kB
+        total = meminfo.get("MemTotal", 0)
+        avail = meminfo.get("MemAvailable", 0)
+        used = max(total - avail, 0)
+        if total:
+            stats["ram_percent"] = round(used / total * 100, 1)
+            stats["ram_used_gb"] = round(used / 1024 / 1024, 2)
+            stats["ram_total_gb"] = round(total / 1024 / 1024, 2)
+    except Exception:
+        pass
+    try:
+        du = shutil.disk_usage("/")
+        stats["disk_percent"] = round(du.used / du.total * 100, 1)
+        stats["disk_used_gb"] = round(du.used / 1024 / 1024 / 1024, 2)
+        stats["disk_total_gb"] = round(du.total / 1024 / 1024 / 1024, 2)
+    except Exception:
+        pass
+    return stats
+
+
+# -------------------------------------------------------- service check ----
+
+def _systemd_is_active(unit):
+    """Return True/False/None (None = unit not found / systemctl unavailable,
+    as opposed to a definite down state)."""
+    try:
+        r = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True, timeout=5)
+        state = r.stdout.strip()
+        if state == "active":
+            return True
+        if state in ("inactive", "failed", "activating", "deactivating"):
+            return False
+        return None
+    except Exception:
+        return None
+
+
+def _port_is_open(port, host="127.0.0.1", timeout=2):
+    if not port:
+        return None
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            return s.connect_ex((host, port)) == 0
+    except Exception:
+        return False
+
+
+def get_services_status():
+    """Check each watched service/port. A service is reported 'up' if either
+    the systemd unit is active OR (when there's no matching unit / systemd
+    isn't in play) the port is reachable — so this still works for the
+    optional ws-ssl unit that isn't installed unless the operator chose an
+    SSL port during install."""
+    results = []
+    for svc in WATCHED_SERVICES:
+        systemd_state = _systemd_is_active(svc["service"]) if svc.get("service") else None
+        port_state = _port_is_open(svc.get("port")) if svc.get("port") else None
+
+        if systemd_state is None and port_state is None:
+            # neither check gave us anything meaningful (e.g. optional
+            # service not installed) — skip it instead of showing a
+            # misleading red warning
+            if svc.get("port") is None and systemd_state is None:
+                # still show it as unknown/not-installed rather than hiding,
+                # unless it's a genuinely optional unit with no unit file
+                pass
+
+        is_up = bool(systemd_state) or bool(port_state)
+        # only mark "down" (red) if we got at least one definite signal;
+        # if both checks are None, treat as "not installed" rather than down
+        known = systemd_state is not None or port_state is not None
+        results.append({
+            "key": svc["key"],
+            "label": svc["label"],
+            "up": is_up,
+            "known": known,
+        })
+
+    # de-duplicate ssh / sshd into a single "SSH" row (different distros
+    # name the unit differently; whichever one resolves wins)
+    merged = []
+    seen_ssh = None
+    for r in results:
+        if r["key"] in ("ssh", "ssh_alt"):
+            if seen_ssh is None:
+                r["label"] = "SSH (22)"
+                seen_ssh = r
+                merged.append(r)
+            else:
+                if r["up"] or r["known"]:
+                    seen_ssh["up"] = seen_ssh["up"] or r["up"]
+                    seen_ssh["known"] = seen_ssh["known"] or r["known"]
+        else:
+            merged.append(r)
+    return merged
+
+
 # ---------------------------------------------------------------- auth ----
 
 @app.route("/login", methods=["GET", "POST"])
@@ -234,8 +479,27 @@ def dashboard():
     }
     stats["active"] = stats["total"] - stats["ended"]
     return render_template(
-        "dashboard.html", users=users, stats=stats, panel_user=load_auth()["username"]
+        "dashboard.html",
+        users=users,
+        stats=stats,
+        panel_user=load_auth()["username"],
+        sys_stats=get_system_stats(),
+        services=get_services_status(),
     )
+
+
+@app.route("/api/sysstats")
+@login_required
+def api_sysstats():
+    return jsonify(ok=True, stats=get_system_stats(), services=get_services_status())
+
+
+@app.route("/api/usage/<username>")
+@login_required
+def api_usage(username):
+    if not USERNAME_RE.match(username) or not user_exists(username):
+        return jsonify(ok=False, error="User မရှိပါ"), 400
+    return jsonify(ok=True, **get_usage_detail_gb(username))
 
 
 @app.route("/api/create", methods=["POST"])
@@ -261,10 +525,7 @@ def api_create():
     try:
         subprocess.run(["useradd", "-M", "-N", "-s", "/usr/sbin/nologin", "-e", exp, user], check=True)
         subprocess.run(["chpasswd"], input=f"{user}:{password}\n", text=True, check=True)
-        uid = subprocess.run(["id", "-u", user], capture_output=True, text=True, check=True).stdout.strip()
-        subprocess.run(
-            ["iptables", "-A", "OUTPUT", "-m", "owner", "--uid-owner", uid, "-m", "comment", "--comment", f"wsdata-{user}", "-j", "ACCEPT"]
-        )
+        ensure_traffic_rules(user)
     except subprocess.CalledProcessError as e:
         return jsonify(ok=False, error=f"system command failed: {e}"), 500
 
@@ -286,11 +547,9 @@ def api_delete():
         return jsonify(ok=False, error="bad username"), 400
 
     if user_exists(user):
-        uid = subprocess.run(["id", "-u", user], capture_output=True, text=True).stdout.strip()
+        uid = _uid_of(user)
         subprocess.run(["pkill", "-9", "-u", user])
-        subprocess.run(
-            ["iptables", "-D", "OUTPUT", "-m", "owner", "--uid-owner", uid, "-m", "comment", "--comment", f"wsdata-{user}", "-j", "ACCEPT"]
-        )
+        remove_traffic_rules(user, uid)
         subprocess.run(["userdel", "-f", user])
 
     for d in (LIMIT_DIR, INFO_DIR):
@@ -402,14 +661,28 @@ def auto_kick_enforcer():
         time.sleep(AUTO_KICK_INTERVAL)
 
 
+def backfill_traffic_rules():
+    """One-time-per-boot pass so users created by an older version of this
+    panel (upload-only OUTPUT rule) get the missing INPUT (download) rule
+    added, without ever touching or duplicating existing rules."""
+    try:
+        ensure_dirs()
+        for user in os.listdir(LIMIT_DIR):
+            if user_exists(user):
+                ensure_traffic_rules(user)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     ensure_dirs()
     load_auth()
+    backfill_traffic_rules()
     threading.Thread(target=auto_kick_enforcer, daemon=True).start()
     port = int(os.environ.get("PANEL_PORT", "2053"))
     app.run(host="0.0.0.0", port=port)
-
 APPEOF
+
 
 echo -e "${YELLOW}[*] writing templates ...${NC}"
 cat <<'LOGINEOF' > /opt/ws-panel/templates/login.html
@@ -511,6 +784,42 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
   .stat.ended .n{color:var(--red);}
   .stat.active .n{color:var(--green);}
 
+  /* ── system monitor cards ──────────────────────────────────────── */
+  .sysgrid{
+    display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:16px;
+  }
+  .syscard{
+    background:var(--card); border:1px solid var(--border); border-radius:10px;
+    padding:14px 16px;
+  }
+  .syscard .top{display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px;}
+  .syscard .label{font-size:12px; color:var(--muted); font-weight:600; letter-spacing:.2px;}
+  .syscard .pct{font-size:20px; font-weight:700;}
+  .syscard .sub{font-size:11px; color:var(--muted); margin-top:6px;}
+  .bar{width:100%; height:6px; border-radius:99px; background:#20242f; overflow:hidden;}
+  .bar > span{display:block; height:100%; border-radius:99px; background:var(--green); transition:width .3s;}
+  .bar.warn > span{background:var(--yellow);}
+  .bar.danger > span{background:var(--red);}
+  .syscard.warn .pct{color:var(--yellow);}
+  .syscard.danger .pct{color:var(--red);}
+
+  /* ── services status row ───────────────────────────────────────── */
+  .svcrow{
+    display:flex; flex-wrap:wrap; gap:8px; margin-bottom:18px;
+  }
+  .svcpill{
+    display:inline-flex; align-items:center; gap:7px; padding:7px 13px;
+    border-radius:999px; font-size:12.5px; font-weight:600;
+    background:var(--card); border:1px solid var(--border);
+  }
+  .svcpill .dot{width:8px; height:8px; border-radius:50%; flex:none;}
+  .svcpill.up{color:var(--green); border-color:rgba(46,207,129,.3);}
+  .svcpill.up .dot{background:var(--green); box-shadow:0 0 6px rgba(46,207,129,.6);}
+  .svcpill.down{color:var(--red); border-color:rgba(239,79,95,.35); background:rgba(239,79,95,.08);}
+  .svcpill.down .dot{background:var(--red); box-shadow:0 0 6px rgba(239,79,95,.6);}
+  .svcpill.unknown{color:var(--muted);}
+  .svcpill.unknown .dot{background:var(--muted);}
+
   .toolbar{display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:10px;}
   .search{
     flex:1; min-width:180px; max-width:340px; display:flex; align-items:center; gap:8px;
@@ -593,6 +902,7 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
   @media (max-width:720px){
     main{padding:14px 12px 50px;}
     .stats{grid-template-columns:repeat(2,1fr);}
+    .sysgrid{grid-template-columns:repeat(1,1fr);}
     table{min-width:680px;}
   }
 </style>
@@ -608,6 +918,31 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
   </header>
 
   <main>
+    <div class="sysgrid" id="sysgrid">
+      <div class="syscard" id="cpuCard">
+        <div class="top"><span class="label">CPU Load</span><span class="pct" id="cpuPct">{{ sys_stats.cpu_percent }}%</span></div>
+        <div class="bar" id="cpuBar"><span style="width:{{ sys_stats.cpu_percent }}%"></span></div>
+      </div>
+      <div class="syscard" id="ramCard">
+        <div class="top"><span class="label">RAM Usage</span><span class="pct" id="ramPct">{{ sys_stats.ram_percent }}%</span></div>
+        <div class="bar" id="ramBar"><span style="width:{{ sys_stats.ram_percent }}%"></span></div>
+        <div class="sub" id="ramSub">{{ sys_stats.ram_used_gb }} GB / {{ sys_stats.ram_total_gb }} GB</div>
+      </div>
+      <div class="syscard" id="diskCard">
+        <div class="top"><span class="label">SSD / Storage</span><span class="pct" id="diskPct">{{ sys_stats.disk_percent }}%</span></div>
+        <div class="bar" id="diskBar"><span style="width:{{ sys_stats.disk_percent }}%"></span></div>
+        <div class="sub" id="diskSub">{{ sys_stats.disk_used_gb }} GB / {{ sys_stats.disk_total_gb }} GB</div>
+      </div>
+    </div>
+
+    <div class="svcrow" id="svcRow">
+      {% for s in services %}
+        <span class="svcpill {{ 'up' if s.up else ('down' if s.known else 'unknown') }}">
+          <span class="dot"></span>{{ s.label }} · {{ 'Active' if s.up else ('Down' if s.known else 'N/A') }}
+        </span>
+      {% endfor %}
+    </div>
+
     <div class="stats">
       <div class="stat total">
         <div class="n">{{ stats.total }}</div>
@@ -842,11 +1177,55 @@ async function doChangePassword(){
   if(data.ok){ alert('Password ပြောင်းပြီးပါပြီ - ပြန် login ဝင်ပါ'); location.href='/logout'; }
   else { msg.textContent = data.error || 'Error'; msg.className = 'msg err'; }
 }
+
+// ------------------------------------------------ live system monitor ----
+function barClass(pct){
+  if(pct >= 90) return 'danger';
+  if(pct >= 70) return 'warn';
+  return '';
+}
+function applyStat(prefix, pct){
+  const bar = document.getElementById(prefix + 'Bar');
+  const card = document.getElementById(prefix + 'Card');
+  const cls = barClass(pct);
+  bar.className = 'bar ' + cls;
+  bar.querySelector('span').style.width = pct + '%';
+  card.className = 'syscard ' + cls;
+  document.getElementById(prefix + 'Pct').textContent = pct + '%';
+}
+
+async function refreshSysStats(){
+  try{
+    const res = await fetch('/api/sysstats');
+    const data = await res.json();
+    if(!data.ok) return;
+    const s = data.stats;
+    applyStat('cpu', s.cpu_percent);
+    applyStat('ram', s.ram_percent);
+    applyStat('disk', s.disk_percent);
+    document.getElementById('ramSub').textContent = s.ram_used_gb + ' GB / ' + s.ram_total_gb + ' GB';
+    document.getElementById('diskSub').textContent = s.disk_used_gb + ' GB / ' + s.disk_total_gb + ' GB';
+
+    const row = document.getElementById('svcRow');
+    row.innerHTML = data.services.map(svc => {
+      const cls = svc.up ? 'up' : (svc.known ? 'down' : 'unknown');
+      const txt = svc.up ? 'Active' : (svc.known ? 'Down' : 'N/A');
+      return `<span class="svcpill ${cls}"><span class="dot"></span>${svc.label} · ${txt}</span>`;
+    }).join('');
+  }catch(e){ /* ignore transient errors, keep last known state on screen */ }
+}
+setInterval(refreshSysStats, 5000);
 </script>
 </body>
 </html>
 
 DASHEOF
+
+echo -e "${YELLOW}[*] detecting WS/SSL ports from existing install...${NC}"
+DETECTED_WS_PORT=$(grep -oP '(?<=^Environment=WS_PORT=)\d+' /etc/systemd/system/ws-proxy.service 2>/dev/null || true)
+DETECTED_SSL_PORT=$(grep -oP '(?<=^accept = )\d+' /etc/stunnel/ws-ssl.conf 2>/dev/null || true)
+DETECTED_WS_PORT="${DETECTED_WS_PORT:-8880}"
+DETECTED_SSL_PORT="${DETECTED_SSL_PORT:-443}"
 
 echo -e "${YELLOW}[*] systemd service ...${NC}"
 cat <<EOF > /etc/systemd/system/ws-panel.service
@@ -857,6 +1236,8 @@ After=network.target
 [Service]
 WorkingDirectory=/opt/ws-panel
 Environment=PANEL_PORT=${PANEL_PORT}
+Environment=WS_PORT=${DETECTED_WS_PORT}
+Environment=SSL_PORT=${DETECTED_SSL_PORT}
 ExecStart=/usr/bin/python3 /opt/ws-panel/app.py
 Restart=always
 
