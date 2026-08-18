@@ -235,8 +235,27 @@ def _chain_bytes(chain, comment):
         return 0
 
 
-def get_usage_gb(user):
-    """Total traffic (upload + download) for a user, in GB.
+def human_bytes(n):
+    """
+    Format a byte count into a clear, human-readable string with an
+    auto-selected unit — e.g. 512 -> "512 B", 104857600 -> "100 MB",
+    1073741824 -> "1 GB", 1099511627776 -> "1 TB".
+    Uses 1 decimal place except for whole numbers, so "1 GB" not "1.0 GB"
+    but "2.4 GB" when it isn't a round number.
+    """
+    n = float(n or 0)
+    units = [("TB", 1024**4), ("GB", 1024**3), ("MB", 1024**2), ("KB", 1024), ("B", 1)]
+    for label, size in units:
+        if n >= size or label == "B":
+            val = n / size
+            if val == int(val):
+                return f"{int(val)} {label}"
+            return f"{val:.1f} {label}"
+    return "0 B"
+
+
+def get_usage_bytes(user):
+    """Total traffic (upload + download) for a user, in raw bytes.
 
     Upload  = OUTPUT chain, comment wsdata-{user}-out (new) or
               wsdata-{user} (legacy, upload-only rule from older installs).
@@ -248,18 +267,34 @@ def get_usage_gb(user):
         # installs don't suddenly show 0 usage after upgrading the panel
         upload_bytes = _chain_bytes("OUTPUT", f"wsdata-{user}")
     download_bytes = _chain_bytes("INPUT", f"wsdata-{user}-in")
-    total = upload_bytes + download_bytes
-    return round(total / 1024 / 1024 / 1024, 3)
+    return upload_bytes + download_bytes
+
+
+def get_usage_gb(user):
+    """Backward-compat: total traffic in GB (float, 3dp). Prefer
+    get_usage_bytes()+human_bytes() for display; this is kept for any
+    code/sorting that wants a plain numeric GB value."""
+    return round(get_usage_bytes(user) / 1024 / 1024 / 1024, 3)
 
 
 def get_usage_detail_gb(user):
-    """Same as get_usage_gb but broken out by direction, for a detail view."""
+    """Usage detail broken out by direction, both as raw bytes and as a
+    clear human-readable string (100MB / 1GB / 10GB / 1TB style) for the
+    detail view."""
     upload_bytes = _chain_bytes("OUTPUT", f"wsdata-{user}-out") or _chain_bytes("OUTPUT", f"wsdata-{user}")
     download_bytes = _chain_bytes("INPUT", f"wsdata-{user}-in")
+    total_bytes = upload_bytes + download_bytes
     return {
+        "upload_bytes": upload_bytes,
+        "download_bytes": download_bytes,
+        "total_bytes": total_bytes,
+        "upload_fmt": human_bytes(upload_bytes),
+        "download_fmt": human_bytes(download_bytes),
+        "total_fmt": human_bytes(total_bytes),
+        # kept for backward compat with any existing caller expecting *_gb
         "upload_gb": round(upload_bytes / 1024 / 1024 / 1024, 3),
         "download_gb": round(download_bytes / 1024 / 1024 / 1024, 3),
-        "total_gb": round((upload_bytes + download_bytes) / 1024 / 1024 / 1024, 3),
+        "total_gb": round(total_bytes / 1024 / 1024 / 1024, 3),
     }
 
 
@@ -288,6 +323,7 @@ def list_users():
         info_path = os.path.join(INFO_DIR, user)
         password = open(info_path).read().strip() if os.path.exists(info_path) else "-"
         exp = get_expire(user)
+        usage_bytes = get_usage_bytes(user)
         rows.append(
             {
                 "username": user,
@@ -297,7 +333,8 @@ def list_users():
                 "limit": limit,
                 "online": get_online_count(user),
                 "online_ips": get_online_ips(user),
-                "usage_gb": get_usage_gb(user),
+                "usage_bytes": usage_bytes,
+                "usage_fmt": human_bytes(usage_bytes),
             }
         )
     return rows
@@ -690,46 +727,61 @@ cat <<'LOGINEOF' > /opt/ws-panel/templates/login.html
 <html lang="my">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>SSH-WS Panel · Login</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=JetBrains+Mono:wght@500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root{
-    --bg:#0f1115; --card:#171a21; --border:#262b35;
-    --text:#e7e9ee; --muted:#8b93a3; --accent:#4f8cff; --danger:#ef4f5f;
+    --bg:#0a0d13; --card:#12161f; --card2:#0e121a; --border:#1e2430;
+    --text:#e9edf5; --muted:#7d8699; --faint:#4d5566;
+    --signal:#2dd4bf; --accent:#5b8def; --danger:#f0525f;
   }
-  *{box-sizing:border-box;}
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
   body{
     margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
-    background:var(--bg); color:var(--text);
-    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background:var(--bg); color:var(--text); padding:20px;
+    font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;
   }
   .card{
-    width:340px; background:var(--card); border:1px solid var(--border);
-    border-radius:14px; padding:32px 28px; box-shadow:0 10px 30px rgba(0,0,0,.4);
+    width:100%; max-width:360px; background:var(--card); border:1px solid var(--border);
+    border-radius:20px; padding:34px 28px; box-shadow:0 20px 50px rgba(0,0,0,.45);
   }
-  h1{font-size:20px; margin:0 0 4px;}
-  p.sub{color:var(--muted); margin:0 0 24px; font-size:13px;}
-  label{font-size:13px; color:var(--muted); display:block; margin:14px 0 6px;}
+  .mark{
+    width:44px; height:44px; border-radius:13px; margin-bottom:18px;
+    background:linear-gradient(150deg,var(--signal),#1a8f82);
+    display:flex; align-items:center; justify-content:center;
+    font-family:'Space Grotesk',sans-serif; font-weight:700; font-size:20px; color:#04211d;
+  }
+  h1{font-family:'Space Grotesk',sans-serif; font-size:21px; margin:0 0 4px;}
+  p.sub{color:var(--muted); margin:0 0 26px; font-size:13.5px;}
+  label{font-size:12.5px; color:var(--muted); display:block; margin:16px 0 7px;}
   input{
-    width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--border);
-    background:#0f1115; color:var(--text); font-size:14px;
+    width:100%; padding:12px 14px; border-radius:11px; border:1px solid var(--border);
+    background:var(--card2); color:var(--text); font-size:14.5px; font-family:'JetBrains Mono',monospace;
   }
   input:focus{outline:none; border-color:var(--accent);}
   button{
-    width:100%; margin-top:22px; padding:11px; border:none; border-radius:8px;
-    background:var(--accent); color:#fff; font-size:15px; font-weight:600; cursor:pointer;
+    width:100%; margin-top:24px; padding:13px; border:none; border-radius:12px;
+    background:linear-gradient(150deg,var(--accent),#3f6fd6); color:#fff;
+    font-family:'Inter',sans-serif; font-size:15px; font-weight:600; cursor:pointer;
   }
-  button:hover{filter:brightness(1.08);}
-  .err{color:var(--danger); font-size:13px; margin-top:14px; text-align:center;}
-  .credit{color:var(--muted); font-size:11px; text-align:center; margin-top:18px; letter-spacing:.3px;}
+  button:active{transform:scale(.98);}
+  .err{
+    color:var(--danger); font-size:13px; margin-top:16px; text-align:center;
+    background:rgba(240,82,95,.1); border:1px solid rgba(240,82,95,.25);
+    border-radius:9px; padding:9px;
+  }
+  .credit{color:var(--faint); font-size:11px; text-align:center; margin-top:22px; letter-spacing:.3px;}
 </style>
 </head>
 <body>
   <form class="card" method="post" action="/login">
+    <div class="mark">W</div>
     <h1>SSH-WS Panel</h1>
     <p class="sub">အက်ဒမင် အကောင့်ဝင်ရန်</p>
     <label>အသုံးပြုသူအမည်</label>
-    <input name="username" autocomplete="username" required>
+    <input name="username" autocomplete="username" required autocapitalize="off">
     <label>စကားဝှက်</label>
     <input name="password" type="password" autocomplete="current-password" required>
     <button type="submit">ဝင်မည်</button>
@@ -746,361 +798,461 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
 <html lang="my">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>SSH-WS Panel</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root{
-    --bg:#0c0e13; --card:#151821; --card2:#11141b; --border:#252a36; --row:#1a1e28;
-    --text:#e9ebf1; --muted:#8a91a3; --accent:#4f8cff; --green:#2ecf81;
-    --red:#ef4f5f; --yellow:#e2b93b;
+    --bg:#0a0d13; --bg2:#070911;
+    --card:#12161f; --card2:#0e121a; --border:#1e2430; --row:#171c26;
+    --text:#e9edf5; --muted:#7d8699; --faint:#4d5566;
+    --signal:#2dd4bf; --accent:#5b8def; --danger:#f0525f; --warn:#e8b339;
+    font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;
   }
-  *{box-sizing:border-box;}
-  body{
-    margin:0; background:var(--bg); color:var(--text); min-height:100vh;
-    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
+  html,body{margin:0; background:var(--bg); color:var(--text);}
+  body{min-height:100vh; padding-bottom:calc(84px + env(safe-area-inset-bottom)); -webkit-font-smoothing:antialiased;}
+  h1,h2,h3{font-family:'Space Grotesk',sans-serif;}
+  .mono{font-family:'JetBrains Mono',ui-monospace,monospace;}
+
   header{
-    display:flex; align-items:center; justify-content:space-between;
-    padding:14px 22px; border-bottom:1px solid var(--border); position:sticky; top:0;
-    background:var(--bg); z-index:5;
+    position:sticky; top:0; z-index:30; display:flex; align-items:center; justify-content:space-between;
+    padding:14px 18px; padding-top:calc(14px + env(safe-area-inset-top));
+    background:rgba(10,13,19,.85); backdrop-filter:blur(14px); border-bottom:1px solid var(--border);
   }
-  header h1{font-size:17px; margin:0; letter-spacing:.2px;}
-  header .right{display:flex; gap:10px; align-items:center;}
-  .muted{color:var(--muted); font-size:13px;}
-  main{padding:18px 18px 60px; max-width:1280px; margin:0 auto;}
+  .brand{display:flex; align-items:center; gap:10px;}
+  .brand .mark{
+    width:30px; height:30px; border-radius:9px; flex:none;
+    background:linear-gradient(150deg,var(--signal),#1a8f82);
+    display:flex; align-items:center; justify-content:center;
+    font-family:'Space Grotesk',sans-serif; font-weight:700; font-size:14px; color:#04211d;
+  }
+  .brand h1{font-size:16px; font-weight:600; margin:0;}
+  .brand .env{font-size:10.5px; color:var(--muted); margin-top:1px;}
+  .avatar-btn{
+    width:34px; height:34px; border-radius:50%; border:1px solid var(--border);
+    background:var(--card2); color:var(--muted); display:flex; align-items:center;
+    justify-content:center; font-size:13px; font-weight:600;
+  }
 
-  /* ── stat cards ─────────────────────────────────────────────────── */
-  .stats{
-    display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:16px;
-  }
-  .stat{
-    background:var(--card); border:1px solid var(--border); border-radius:10px;
-    padding:13px 16px;
-  }
-  .stat .n{font-size:22px; font-weight:700; display:flex; align-items:center; gap:7px;}
-  .stat .l{color:var(--muted); font-size:12px; margin-top:3px;}
-  .stat .dot{width:8px; height:8px; border-radius:50%; flex:none;}
-  .stat.online .dot{background:var(--green);}
-  .stat.ended .n{color:var(--red);}
-  .stat.active .n{color:var(--green);}
+  main{padding:16px 16px 8px; max-width:640px; margin:0 auto;}
 
-  /* ── system monitor cards ──────────────────────────────────────── */
-  .sysgrid{
-    display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:16px;
+  .signals{display:flex; gap:8px; overflow-x:auto; padding:2px 2px 14px; margin:0 -2px 4px; scrollbar-width:none;}
+  .signals::-webkit-scrollbar{display:none;}
+  .sigchip{
+    flex:none; display:flex; align-items:center; gap:7px; padding:8px 13px;
+    background:var(--card); border:1px solid var(--border); border-radius:999px;
+    font-size:12px; font-weight:500; color:var(--muted); white-space:nowrap;
   }
-  .syscard{
-    background:var(--card); border:1px solid var(--border); border-radius:10px;
-    padding:14px 16px;
+  .sigdot{width:7px; height:7px; border-radius:50%; flex:none; background:var(--faint); position:relative;}
+  .sigchip.up{color:var(--text);}
+  .sigchip.up .sigdot{background:var(--signal);}
+  .sigchip.up .sigdot::after{
+    content:''; position:absolute; inset:-4px; border-radius:50%;
+    border:1.5px solid var(--signal); animation:ping 2.2s cubic-bezier(.4,0,.3,1) infinite;
   }
-  .syscard .top{display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px;}
-  .syscard .label{font-size:12px; color:var(--muted); font-weight:600; letter-spacing:.2px;}
-  .syscard .pct{font-size:20px; font-weight:700;}
-  .syscard .sub{font-size:11px; color:var(--muted); margin-top:6px;}
-  .bar{width:100%; height:6px; border-radius:99px; background:#20242f; overflow:hidden;}
-  .bar > span{display:block; height:100%; border-radius:99px; background:var(--green); transition:width .3s;}
-  .bar.warn > span{background:var(--yellow);}
-  .bar.danger > span{background:var(--red);}
-  .syscard.warn .pct{color:var(--yellow);}
-  .syscard.danger .pct{color:var(--red);}
+  .sigchip.down{color:var(--danger);}
+  .sigchip.down .sigdot{background:var(--danger);}
+  @keyframes ping{0%{transform:scale(.6); opacity:.9;} 75%,100%{transform:scale(1.9); opacity:0;}}
+  @media (prefers-reduced-motion:reduce){ .sigchip.up .sigdot::after{animation:none; display:none;} }
 
-  /* ── services status row ───────────────────────────────────────── */
-  .svcrow{
-    display:flex; flex-wrap:wrap; gap:8px; margin-bottom:18px;
-  }
-  .svcpill{
-    display:inline-flex; align-items:center; gap:7px; padding:7px 13px;
-    border-radius:999px; font-size:12.5px; font-weight:600;
-    background:var(--card); border:1px solid var(--border);
-  }
-  .svcpill .dot{width:8px; height:8px; border-radius:50%; flex:none;}
-  .svcpill.up{color:var(--green); border-color:rgba(46,207,129,.3);}
-  .svcpill.up .dot{background:var(--green); box-shadow:0 0 6px rgba(46,207,129,.6);}
-  .svcpill.down{color:var(--red); border-color:rgba(239,79,95,.35); background:rgba(239,79,95,.08);}
-  .svcpill.down .dot{background:var(--red); box-shadow:0 0 6px rgba(239,79,95,.6);}
-  .svcpill.unknown{color:var(--muted);}
-  .svcpill.unknown .dot{background:var(--muted);}
+  .stats{display:grid; grid-template-columns:repeat(2,1fr); gap:10px; margin-bottom:18px;}
+  .stat{background:var(--card); border:1px solid var(--border); border-radius:14px; padding:14px 16px;}
+  .stat .n{font-family:'Space Grotesk',sans-serif; font-size:24px; font-weight:700; line-height:1;}
+  .stat .l{color:var(--muted); font-size:11.5px; margin-top:6px;}
+  .stat.online .n{color:var(--signal);}
+  .stat.ended .n{color:var(--danger);}
 
-  .toolbar{display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:10px;}
+  .sysrow{display:flex; gap:8px; margin-bottom:20px;}
+  .sysmini{flex:1; background:var(--card); border:1px solid var(--border); border-radius:12px; padding:10px 12px;}
+  .sysmini .top{display:flex; justify-content:space-between; font-size:10.5px; color:var(--muted); margin-bottom:6px;}
+  .sysmini .pct{font-weight:600; color:var(--text); font-size:11px;}
+  .bar{width:100%; height:4px; border-radius:99px; background:var(--card2); overflow:hidden;}
+  .bar>span{display:block; height:100%; border-radius:99px; background:var(--signal); transition:width .4s;}
+  .bar.warn>span{background:var(--warn);}
+  .bar.danger>span{background:var(--danger);}
+  .sysmini.warn .pct{color:var(--warn);} .sysmini.danger .pct{color:var(--danger);}
+  .sysmini .sub{font-size:9.5px; color:var(--faint); margin-top:5px;}
+
+  .section-head{display:flex; align-items:center; justify-content:space-between; margin:4px 2px 10px;}
+  .section-head h2{font-size:13px; font-weight:600; margin:0; color:var(--muted); letter-spacing:.3px; text-transform:uppercase;}
+  .count-pill{font-size:11px; color:var(--faint); font-family:'JetBrains Mono',monospace;}
+
   .search{
-    flex:1; min-width:180px; max-width:340px; display:flex; align-items:center; gap:8px;
-    background:var(--card); border:1px solid var(--border); border-radius:8px; padding:0 12px;
+    display:flex; align-items:center; gap:9px; background:var(--card);
+    border:1px solid var(--border); border-radius:12px; padding:11px 14px; margin-bottom:12px;
   }
-  .search svg{flex:none; opacity:.5;}
-  .search input{
-    border:none; background:none; color:var(--text); font-size:13px; padding:9px 0;
-    width:100%; outline:none;
-  }
+  .search svg{flex:none; color:var(--faint);}
+  .search input{border:none; background:none; outline:none; color:var(--text); font-size:14px; width:100%;}
+  .search input::placeholder{color:var(--faint);}
 
-  .btn{
-    border:none; border-radius:8px; padding:9px 14px; font-size:13px; font-weight:600;
-    cursor:pointer; color:#fff; background:var(--accent);
+  .ulist{display:flex; flex-direction:column; gap:8px; margin-bottom:26px;}
+  .ucard{
+    background:var(--card); border:1px solid var(--border); border-radius:14px;
+    padding:13px 14px; display:flex; flex-direction:column; gap:9px; cursor:pointer;
+    transition:border-color .15s;
   }
-  .btn.green{background:var(--green);}
-  .btn.red{background:var(--red);}
-  .btn.ghost{background:transparent; border:1px solid var(--border); color:var(--text);}
-  .btn:hover{filter:brightness(1.1);}
-  .btn.small{padding:6px 10px; font-size:12px;}
+  .ucard:active{border-color:var(--accent);}
+  .ucard.expired{background:linear-gradient(180deg,rgba(240,82,95,.06),var(--card) 60%); border-color:rgba(240,82,95,.28);}
+  .urow-top{display:flex; align-items:center; justify-content:space-between; gap:8px;}
+  .uid{display:flex; align-items:center; gap:9px; min-width:0;}
+  .uid .dot{width:8px; height:8px; border-radius:50%; flex:none; background:var(--faint);}
+  .uid .dot.on{background:var(--signal); box-shadow:0 0 0 3px rgba(45,212,191,.15);}
+  .uname{font-family:'JetBrains Mono',monospace; font-weight:600; font-size:14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  .expired .uname{color:var(--danger);}
+  .chev{color:var(--faint); flex:none;}
+  .urow-meta{display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:11.5px; color:var(--muted);}
+  .pill{padding:3px 9px; border-radius:999px; background:var(--card2); border:1px solid var(--border); font-size:11px;}
+  .pill.expired{background:rgba(240,82,95,.14); color:var(--danger); border-color:rgba(240,82,95,.3);}
+  .pill.online{background:rgba(45,212,191,.12); color:var(--signal); border-color:rgba(45,212,191,.28);}
+  .pill.usage{font-family:'JetBrains Mono',monospace;}
+  .ipchips{display:flex; gap:5px; flex-wrap:wrap;}
+  .ipchip{
+    font-family:'JetBrains Mono',monospace; font-size:10.5px; color:var(--accent);
+    background:rgba(91,141,239,.1); border:1px solid rgba(91,141,239,.25); border-radius:6px; padding:2px 6px;
+  }
+  .empty{padding:50px 20px; text-align:center; color:var(--muted); font-size:13.5px;}
+  .empty .big{font-size:30px; margin-bottom:10px;}
 
-  /* ── table: real table at all sizes, horizontal-scroll on mobile ──── */
-  .tablewrap{
-    border:1px solid var(--border); border-radius:12px; overflow-x:auto;
-    background:var(--card); -webkit-overflow-scrolling:touch;
+  .fab{
+    position:fixed; right:18px; bottom:calc(22px + env(safe-area-inset-bottom));
+    width:56px; height:56px; border-radius:50%; border:none; z-index:25;
+    background:linear-gradient(150deg,var(--accent),#3f6fd6); color:#fff;
+    display:flex; align-items:center; justify-content:center;
+    box-shadow:0 8px 22px rgba(91,141,239,.4); cursor:pointer;
   }
-  table{width:100%; border-collapse:collapse; min-width:760px;}
-  thead th{
-    text-align:left; font-size:11px; color:var(--muted); text-transform:uppercase;
-    letter-spacing:.4px; padding:11px 14px; border-bottom:1px solid var(--border);
-    white-space:nowrap; position:sticky; top:0; background:var(--card);
-  }
-  tbody td{padding:11px 14px; font-size:13.5px; border-bottom:1px solid var(--border); vertical-align:middle; white-space:nowrap;}
-  tbody tr:last-child td{border-bottom:none;}
-  tbody tr:hover{background:var(--row);}
-  .uname{font-weight:600;}
-  .pw{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; cursor:pointer; color:var(--muted);}
-  .pw:hover{color:var(--text);}
-  .status{display:inline-flex; align-items:center; gap:6px; font-size:12.5px; font-weight:600;}
-  .status .dot{width:7px; height:7px; border-radius:50%; flex:none;}
-  .status.on{color:var(--green);} .status.on .dot{background:var(--green);}
-  .status.off{color:var(--muted);} .status.off .dot{background:var(--muted);}
-  .badge{padding:3px 9px; border-radius:999px; font-size:11.5px; font-weight:600; white-space:nowrap;}
-  .badge.expired{background:rgba(239,79,95,.15); color:var(--red);}
-  tr.expired-row{background:rgba(239,79,95,.07);}
-  tr.expired-row:hover{background:rgba(239,79,95,.13);}
-  tr.expired-row .uname{color:var(--red);}
-  .actions{display:flex; gap:6px;}
-  .card{background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px; margin-top:24px;}
-  .card h2{font-size:15px; margin:0 0 12px;}
-  .ipbadge{
-    display:inline-block; background:rgba(79,140,255,.12); color:var(--accent);
-    border:1px solid rgba(79,140,255,.25); border-radius:6px;
-    padding:2px 7px; font-size:11px; font-family:monospace; margin:1px;
-  }
-  .empty{padding:40px 14px; text-align:center; color:var(--muted); font-size:13px;}
+  .fab:active{transform:scale(.94);}
 
-  /* modal */
-  .overlay{
-    position:fixed; inset:0; background:rgba(0,0,0,.55); display:none;
-    align-items:center; justify-content:center; z-index:20;
+  .scrim{
+    position:fixed; inset:0; background:rgba(4,5,9,.6); backdrop-filter:blur(2px);
+    opacity:0; pointer-events:none; transition:opacity .22s; z-index:40;
   }
-  .overlay.show{display:flex;}
-  .modal{
-    width:340px; background:var(--card); border:1px solid var(--border);
-    border-radius:14px; padding:22px; box-shadow:0 10px 30px rgba(0,0,0,.5);
+  .scrim.show{opacity:1; pointer-events:auto;}
+  .sheet{
+    position:fixed; left:0; right:0; bottom:0; z-index:41;
+    background:var(--card); border:1px solid var(--border); border-bottom:none;
+    border-radius:20px 20px 0 0; padding:10px 18px calc(22px + env(safe-area-inset-bottom));
+    transform:translateY(100%); transition:transform .28s cubic-bezier(.32,.72,0,1);
+    max-height:85vh; overflow-y:auto;
   }
-  .modal h3{margin:0 0 16px; font-size:16px;}
-  .modal label{font-size:12px; color:var(--muted); display:block; margin:10px 0 5px;}
-  .modal input{
-    width:100%; padding:9px 11px; border-radius:8px; border:1px solid var(--border);
-    background:#0f1115; color:var(--text); font-size:14px;
+  .sheet.show{transform:translateY(0);}
+  .sheet .grabber{width:36px; height:4px; border-radius:99px; background:var(--border); margin:2px auto 16px;}
+  .sheet h3{font-family:'JetBrains Mono',monospace; font-size:17px; margin:0 0 2px; display:flex; align-items:center; gap:8px;}
+  .sheet .subtxt{color:var(--muted); font-size:12.5px; margin-bottom:16px;}
+  .sheet-grid{display:grid; grid-template-columns:1fr 1fr; gap:9px; margin-bottom:8px;}
+  .sbtn{
+    display:flex; flex-direction:column; align-items:center; gap:7px; padding:15px 8px;
+    border-radius:14px; border:1px solid var(--border); background:var(--card2); color:var(--text);
+    font-size:12.5px; font-weight:500; font-family:'Inter',sans-serif;
   }
-  .modal .row{display:flex; gap:10px; margin-top:20px;}
-  .modal .row .btn{flex:1;}
-  .msg{font-size:13px; margin-top:10px; min-height:16px;}
-  .msg.err{color:var(--red);}
-  .msg.ok{color:var(--green);}
-  .credit{color:var(--muted); font-size:11px; text-align:center; margin-top:22px; letter-spacing:.3px;}
-  @media (max-width:720px){
-    main{padding:14px 12px 50px;}
-    .stats{grid-template-columns:repeat(2,1fr);}
-    .sysgrid{grid-template-columns:repeat(1,1fr);}
-    table{min-width:680px;}
+  .sbtn svg{color:var(--accent);}
+  .sbtn.danger svg{color:var(--danger);}
+  .sbtn.danger{border-color:rgba(240,82,95,.25);}
+  .sheet .field{margin-top:14px;}
+  .sheet .field label{font-size:11.5px; color:var(--muted); display:block; margin-bottom:6px;}
+  .sheet .field .valrow{
+    display:flex; align-items:center; justify-content:space-between; gap:10px;
+    background:var(--card2); border:1px solid var(--border); border-radius:10px; padding:10px 13px;
   }
+  .sheet .field .valrow span{font-family:'JetBrains Mono',monospace; font-size:13.5px;}
+  .copybtn{background:none; border:none; color:var(--faint); padding:4px;}
+
+  .field-in{margin-bottom:13px;}
+  .field-in label{font-size:12px; color:var(--muted); display:block; margin-bottom:6px;}
+  .field-in input{
+    width:100%; padding:11px 13px; border-radius:10px; border:1px solid var(--border);
+    background:var(--card2); color:var(--text); font-size:14px; font-family:'JetBrains Mono',monospace;
+  }
+  .field-in input:focus{outline:none; border-color:var(--accent);}
+  .primary-btn{
+    width:100%; padding:13px; border:none; border-radius:12px; margin-top:6px;
+    background:var(--accent); color:#fff; font-weight:600; font-size:14.5px; font-family:'Inter',sans-serif;
+  }
+  .primary-btn.danger{background:var(--danger);}
+  .msg{font-size:12.5px; margin-top:10px; min-height:16px;}
+  .msg.err{color:var(--danger);}
+  .msg.ok{color:var(--signal);}
+
+  .daychips{display:flex; gap:8px; flex-wrap:wrap;}
+  .daychip{
+    padding:9px 15px; border-radius:999px; border:1px solid var(--border);
+    background:var(--card2); color:var(--text); font-size:13.5px; font-weight:600;
+    font-family:'JetBrains Mono',monospace;
+  }
+  .daychip.active{background:rgba(45,212,191,.14); border-color:var(--signal); color:var(--signal);}
+
+  .toast{
+    position:fixed; left:50%; bottom:100px; transform:translateX(-50%) translateY(10px);
+    background:#1a1f2b; border:1px solid var(--border); color:var(--text); font-size:13px;
+    padding:10px 18px; border-radius:999px; opacity:0; pointer-events:none;
+    transition:all .25s; z-index:60; white-space:nowrap;
+  }
+  .toast.show{opacity:1; transform:translateX(-50%) translateY(0);}
+  .credit{color:var(--faint); font-size:11px; text-align:center; margin:18px 0 6px;}
 </style>
 </head>
 <body>
+
   <header>
-    <h1>SSH-WS Panel</h1>
-    <div class="right">
-      <span class="muted">{{ panel_user }}</span>
-      <button class="btn ghost small" onclick="openModal('pwModal')">စကားဝှက်ပြောင်းမည်</button>
-      <a class="btn ghost small" href="/logout" style="text-decoration:none;">ထွက်မည်</a>
+    <div class="brand">
+      <div class="mark">W</div>
+      <div>
+        <h1>SSH·WS Panel</h1>
+        <div class="env">{{ panel_user }}</div>
+      </div>
     </div>
+    <button class="avatar-btn" onclick="openSheet('accountSheet')">{{ panel_user[0]|upper }}</button>
   </header>
 
   <main>
-    <div class="sysgrid" id="sysgrid">
-      <div class="syscard" id="cpuCard">
-        <div class="top"><span class="label">CPU Load</span><span class="pct" id="cpuPct">{{ sys_stats.cpu_percent }}%</span></div>
-        <div class="bar" id="cpuBar"><span style="width:{{ sys_stats.cpu_percent }}%"></span></div>
-      </div>
-      <div class="syscard" id="ramCard">
-        <div class="top"><span class="label">RAM Usage</span><span class="pct" id="ramPct">{{ sys_stats.ram_percent }}%</span></div>
-        <div class="bar" id="ramBar"><span style="width:{{ sys_stats.ram_percent }}%"></span></div>
-        <div class="sub" id="ramSub">{{ sys_stats.ram_used_gb }} GB / {{ sys_stats.ram_total_gb }} GB</div>
-      </div>
-      <div class="syscard" id="diskCard">
-        <div class="top"><span class="label">SSD / Storage</span><span class="pct" id="diskPct">{{ sys_stats.disk_percent }}%</span></div>
-        <div class="bar" id="diskBar"><span style="width:{{ sys_stats.disk_percent }}%"></span></div>
-        <div class="sub" id="diskSub">{{ sys_stats.disk_used_gb }} GB / {{ sys_stats.disk_total_gb }} GB</div>
-      </div>
-    </div>
-
-    <div class="svcrow" id="svcRow">
+    <div class="signals" id="svcRow">
       {% for s in services %}
-        <span class="svcpill {{ 'up' if s.up else ('down' if s.known else 'unknown') }}">
-          <span class="dot"></span>{{ s.label }} · {{ 'Active' if s.up else ('Down' if s.known else 'N/A') }}
+        <span class="sigchip {{ 'up' if s.up else ('down' if s.known else '') }}">
+          <span class="sigdot"></span>{{ s.label }}
         </span>
       {% endfor %}
     </div>
 
     <div class="stats">
-      <div class="stat total">
-        <div class="n">{{ stats.total }}</div>
-        <div class="l">အသုံးပြုသူ စုစုပေါင်း</div>
+      <div class="stat total"><div class="n">{{ stats.total }}</div><div class="l">အသုံးပြုသူ စုစုပေါင်း</div></div>
+      <div class="stat online"><div class="n">{{ stats.online }}</div><div class="l">အွန်လိုင်း အခုလက်ရှိ</div></div>
+      <div class="stat active"><div class="n">{{ stats.active }}</div><div class="l">သက်တမ်းရှိ</div></div>
+      <div class="stat ended"><div class="n">{{ stats.ended }}</div><div class="l">သက်တမ်းကုန်</div></div>
+    </div>
+
+    <div class="sysrow" id="sysrow">
+      <div class="sysmini" id="cpuCard">
+        <div class="top"><span>CPU</span><span class="pct" id="cpuPct">{{ sys_stats.cpu_percent }}%</span></div>
+        <div class="bar" id="cpuBar"><span style="width:{{ sys_stats.cpu_percent }}%"></span></div>
       </div>
-      <div class="stat online">
-        <div class="n"><span class="dot"></span>{{ stats.online }}</div>
-        <div class="l">အွန်လိုင်း</div>
+      <div class="sysmini" id="ramCard">
+        <div class="top"><span>RAM</span><span class="pct" id="ramPct">{{ sys_stats.ram_percent }}%</span></div>
+        <div class="bar" id="ramBar"><span style="width:{{ sys_stats.ram_percent }}%"></span></div>
+        <div class="sub" id="ramSub">{{ sys_stats.ram_used_gb }}GB/{{ sys_stats.ram_total_gb }}GB</div>
       </div>
-      <div class="stat active">
-        <div class="n">{{ stats.active }}</div>
-        <div class="l">သက်တမ်းရှိ</div>
-      </div>
-      <div class="stat ended">
-        <div class="n">{{ stats.ended }}</div>
-        <div class="l">သက်တမ်းကုန်</div>
+      <div class="sysmini" id="diskCard">
+        <div class="top"><span>SSD</span><span class="pct" id="diskPct">{{ sys_stats.disk_percent }}%</span></div>
+        <div class="bar" id="diskBar"><span style="width:{{ sys_stats.disk_percent }}%"></span></div>
+        <div class="sub" id="diskSub">{{ sys_stats.disk_used_gb }}GB/{{ sys_stats.disk_total_gb }}GB</div>
       </div>
     </div>
 
-    <div class="toolbar">
-      <div class="search">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-        <input id="searchBox" placeholder="အသုံးပြုသူအမည် ရှာရန်..." oninput="filterRows()">
-      </div>
-      <button class="btn green" onclick="openModal('createModal')">+ အသုံးပြုသူဖန်တီးမည်</button>
+    <div class="section-head">
+      <h2>Accounts</h2>
+      <span class="count-pill" id="countPill">{{ users|length }} users</span>
     </div>
 
-    <div class="tablewrap">
-    <table>
-      <thead>
-        <tr>
-          <th>အသုံးပြုသူအမည်</th><th>စကားဝှက်</th><th>သက်တမ်းကုန်ဆုံး</th><th>ကန့်သတ်ချက်</th>
-          <th>အွန်လိုင်း</th><th>IP စာရင်း</th><th>အသုံးပြုမှု (GB)</th><th>လုပ်ဆောင်ချက်များ</th>
-        </tr>
-      </thead>
-      <tbody id="userRows">
-        {% for u in users %}
-        <tr data-user="{{ u.username|lower }}"{% if u.expired %} class="expired-row"{% endif %}>
-          <td class="uname">{{ u.username }}</td>
-          <td><span class="pw" title="click to copy" onclick="copyText('{{ u.password }}')">{{ u.password }}</span></td>
-          <td>
-            {% if u.expired %}
-              <span class="badge expired">{{ u.expire }} · EXPIRED</span>
-            {% else %}
-              {{ u.expire }}
-            {% endif %}
-          </td>
-          <td>{{ u.limit }}</td>
-          <td>
-            <span class="status {{ 'on' if u.online > 0 else 'off' }}"><span class="dot"></span>{{ u.online }}</span>
-          </td>
-          <td>
-            {% if u.online_ips %}
-              {% for ip in u.online_ips %}
-                <span class="ipbadge">{{ ip }}</span>
-              {% endfor %}
-            {% else %}
-              <span class="muted">-</span>
-            {% endif %}
-          </td>
-          <td>{{ u.usage_gb }}</td>
-          <td>
-            <div class="actions">
-              <button class="btn small" onclick="openRenew('{{ u.username }}')">သက်တမ်းတိုးမည်</button>
-              <button class="btn ghost small" onclick="openLimit('{{ u.username }}','{{ u.limit }}')">ကန့်သတ်မည်</button>
-              <button class="btn small" style="background:var(--yellow);color:#000" onclick="doKick('{{ u.username }}')">ထုတ်ပစ်မည်</button>
-              <button class="btn red small" onclick="doDelete('{{ u.username }}')">ဖျက်မည်</button>
-            </div>
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="search">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchBox" placeholder="အသုံးပြုသူအမည် ရှာရန်..." oninput="filterUsers()">
     </div>
-    <div id="emptyMsg" class="empty" style="display:none;">ရှာဖွေမှုနှင့် ကိုက်ညီသော အသုံးပြုသူ မတွေ့ပါ</div>
+
+    <div class="ulist" id="ulist">
+      {% for u in users %}
+      <div class="ucard {{ 'expired' if u.expired else '' }}"
+           data-user="{{ u.username|lower }}"
+           data-username="{{ u.username }}"
+           data-password="{{ u.password }}"
+           data-expire="{{ u.expire }}"
+           data-expired="{{ 'true' if u.expired else 'false' }}"
+           data-limit="{{ u.limit }}"
+           data-online="{{ u.online }}"
+           data-usage="{{ u.usage_fmt }}"
+           data-ips="{{ u.online_ips|join(',') }}"
+           onclick="openUserCard(this)">
+        <div class="urow-top">
+          <div class="uid">
+            <span class="dot {{ 'on' if u.online > 0 else '' }}"></span>
+            <span class="uname">{{ u.username }}</span>
+          </div>
+          <svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
+        </div>
+        <div class="urow-meta">
+          {% if u.expired %}
+            <span class="pill expired">EXPIRED · {{ u.expire }}</span>
+          {% else %}
+            <span class="pill">{{ u.expire }}</span>
+          {% endif %}
+          <span class="pill">limit {{ u.limit }}</span>
+          <span class="pill usage">{{ u.usage_fmt }}</span>
+          {% if u.online > 0 %}<span class="pill online">● {{ u.online }} online</span>{% endif %}
+        </div>
+        {% if u.online_ips %}
+        <div class="ipchips">
+          {% for ip in u.online_ips %}<span class="ipchip">{{ ip }}</span>{% endfor %}
+        </div>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    <div id="emptyMsg" class="empty" style="display:none;"><div class="big">🔍</div>ရှာဖွေမှုနှင့် ကိုက်ညီသော အသုံးပြုသူ မတွေ့ပါ</div>
 
     <div class="credit">Dev Phoe Shan</div>
+  </main>
 
-    </main>
+  <button class="fab" onclick="openCreateSheet()" aria-label="Add user">
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+  </button>
 
-  <!-- Create modal -->
-  <div class="overlay" id="createModal">
-    <div class="modal">
-      <h3>အသုံးပြုသူဖန်တီးမည်</h3>
-      <label>အသုံးပြုသူအမည်</label><input id="c_user">
-      <label>စကားဝှက်</label><input id="c_pass">
-      <label>သက်တမ်း (ရက်ပေါင်း)</label><input id="c_days" type="number" value="30">
-      <label>ကန့်သတ်ချက်</label><input id="c_limit" type="number" value="1">
-      <div class="msg" id="c_msg"></div>
-      <div class="row">
-        <button class="btn ghost" onclick="closeModal('createModal')">မလုပ်တော့ပါ</button>
-        <button class="btn green" onclick="doCreate()">ဖန်တီးမည်</button>
-      </div>
+  <div class="scrim" id="scrim" onclick="closeSheets()"></div>
+
+  <!-- Account sheet (avatar button) -->
+  <div class="sheet" id="accountSheet">
+    <div class="grabber"></div>
+    <h3 style="font-family:'Space Grotesk',sans-serif;">{{ panel_user }}</h3>
+    <div class="subtxt">Panel admin account</div>
+    <div class="field-in">
+      <label>အသုံးပြုသူအမည်အသစ် (ရွေးချယ်နိုင်)</label>
+      <input id="pw_user" placeholder="{{ panel_user }}">
     </div>
+    <div class="field-in">
+      <label>စကားဝှက်အသစ်</label>
+      <input id="pw_pass" type="password">
+    </div>
+    <div class="msg" id="pw_msg"></div>
+    <button class="primary-btn" onclick="doChangePassword()">စကားဝှက်ပြောင်းမည်</button>
+    <button class="primary-btn danger" style="margin-top:9px;" onclick="location.href='/logout'">ထွက်မည်</button>
   </div>
 
-  <!-- Renew modal -->
-  <div class="overlay" id="renewModal">
-    <div class="modal">
-      <h3>သက်တမ်းတိုးမည် <span id="r_user_label"></span></h3>
-      <label>ထပ်ထည့်မည့်ရက်ပေါင်း</label><input id="r_days" type="number" value="30">
-      <div class="msg" id="r_msg"></div>
-      <div class="row">
-        <button class="btn ghost" onclick="closeModal('renewModal')">မလုပ်တော့ပါ</button>
-        <button class="btn" onclick="doRenew()">သက်တမ်းတိုးမည်</button>
+  <!-- User action sheet -->
+  <div class="sheet" id="userSheet">
+    <div class="grabber"></div>
+    <h3><span class="mono" id="sh_dot">●</span> <span id="sh_name">username</span></h3>
+    <div class="subtxt" id="sh_sub">-</div>
+
+    <div class="field">
+      <label>စကားဝှက်</label>
+      <div class="valrow">
+        <span id="sh_pw">-</span>
+        <button class="copybtn" onclick="copyText(document.getElementById('sh_pw').textContent)">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        </button>
       </div>
     </div>
+
+    <div class="sheet-grid" style="margin-top:16px;">
+      <button class="sbtn" onclick="openRenewSheet()">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
+        သက်တမ်းတိုးမည်
+      </button>
+      <button class="sbtn" onclick="doKick()">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.4 15A7.5 7.5 0 1 0 6 18.7"/><path d="M12 8v5l3 2"/></svg>
+        ထုတ်ပစ်မည်
+      </button>
+      <button class="sbtn" onclick="openLimitSheet()">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="2" width="16" height="20" rx="2"/><path d="M8 18h8"/></svg>
+        Device ကန့်သတ်
+      </button>
+      <button class="sbtn danger" onclick="doDelete()">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+        ဖျက်မည်
+      </button>
+    </div>
+    <div class="msg" id="u_msg"></div>
   </div>
 
-  <!-- Limit modal -->
-  <div class="overlay" id="limitModal">
-    <div class="modal">
-      <h3>ကန့်သတ်ချက်သတ်မှတ်မည် <span id="l_user_label"></span></h3>
-      <label>ကန့်သတ်ချက်</label><input id="l_value" type="number" value="1">
-      <div class="msg" id="l_msg"></div>
-      <div class="row">
-        <button class="btn ghost" onclick="closeModal('limitModal')">မလုပ်တော့ပါ</button>
-        <button class="btn" onclick="doLimit()">သိမ်းမည်</button>
-      </div>
+  <!-- Renew sheet -->
+  <div class="sheet" id="renewSheet">
+    <div class="grabber"></div>
+    <h3 style="font-family:'Space Grotesk',sans-serif;">သက်တမ်းတိုးမည်</h3>
+    <div class="subtxt"><span id="rn_name">username</span> ကို ဘယ်နှရက် ထပ်ထည့်မလဲ</div>
+    <div class="daychips" id="daychips">
+      <button class="daychip" data-d="7" onclick="pickDays(7)">+7</button>
+      <button class="daychip" data-d="15" onclick="pickDays(15)">+15</button>
+      <button class="daychip active" data-d="30" onclick="pickDays(30)">+30</button>
+      <button class="daychip" data-d="60" onclick="pickDays(60)">+60</button>
+      <button class="daychip" data-d="90" onclick="pickDays(90)">+90</button>
     </div>
+    <div class="field-in" style="margin-top:14px;">
+      <label>ဒါမှမဟုတ် ကိုယ်တိုင်ထည့်မည် (ရက်)</label>
+      <input id="rn_days" type="number" value="30" oninput="customDays()">
+    </div>
+    <div class="subtxt" style="margin:2px 0 4px;">
+      သက်တမ်းသစ် — <span class="mono" id="rn_newdate" style="color:var(--signal); font-weight:600;">-</span>
+    </div>
+    <div class="msg" id="rn_msg"></div>
+    <button class="primary-btn" onclick="confirmRenew()">အတည်ပြု၊ သက်တမ်းတိုးမည်</button>
   </div>
 
-  <!-- Change password modal -->
-  <div class="overlay" id="pwModal">
-    <div class="modal">
-      <h3>Panel စကားဝှက်ပြောင်းမည်</h3>
-      <label>အသုံးပြုသူအမည်အသစ် (ရွေးချယ်နိုင်)</label><input id="pw_user" placeholder="{{ panel_user }}">
-      <label>စကားဝှက်အသစ်</label><input id="pw_pass" type="password">
-      <div class="msg" id="pw_msg"></div>
-      <div class="row">
-        <button class="btn ghost" onclick="closeModal('pwModal')">မလုပ်တော့ပါ</button>
-        <button class="btn" onclick="doChangePassword()">သိမ်းမည်</button>
-      </div>
+  <!-- Limit sheet -->
+  <div class="sheet" id="limitSheet">
+    <div class="grabber"></div>
+    <h3 style="font-family:'Space Grotesk',sans-serif;">Device ကန့်သတ်ချက်</h3>
+    <div class="subtxt"><span id="lm_name">username</span> အတွက် တစ်ပြိုင်နက် login ဝင်ခွင့်</div>
+    <div class="field-in">
+      <label>Device အရေအတွက်</label>
+      <input id="l_value" type="number" value="1">
     </div>
+    <div class="msg" id="l_msg"></div>
+    <button class="primary-btn" onclick="doLimit()">သိမ်းမည်</button>
   </div>
+
+  <!-- Create user sheet -->
+  <div class="sheet" id="createSheet">
+    <div class="grabber"></div>
+    <h3 style="font-family:'Space Grotesk',sans-serif;">အသုံးပြုသူ အသစ်ဖန်တီးမည်</h3>
+    <div class="subtxt">Blank ထားရင် auto-generate လုပ်ပေးမည်</div>
+    <div class="field-in">
+      <label>အသုံးပြုသူအမည်</label>
+      <input id="c_user" placeholder="e.g. mgmg01" autocomplete="off">
+    </div>
+    <div class="field-in">
+      <label>စကားဝှက်</label>
+      <input id="c_pass" placeholder="auto">
+    </div>
+    <div class="field-in">
+      <label>သက်တမ်း (ရက်)</label>
+      <input id="c_days" type="number" value="30">
+    </div>
+    <div class="field-in">
+      <label>Device ကန့်သတ်ချက်</label>
+      <input id="c_limit" type="number" value="1">
+    </div>
+    <div class="msg" id="c_msg"></div>
+    <button class="primary-btn" onclick="doCreate()">ဖန်တီးမည်</button>
+  </div>
+
+  <div class="toast" id="toast"></div>
 
 <script>
 let curUser = null;
 
-function openModal(id){ document.getElementById(id).classList.add('show'); }
-function closeModal(id){ document.getElementById(id).classList.remove('show'); }
-
+// ------------------------------------------------------------ sheets ----
+function openSheet(id){
+  document.getElementById('scrim').classList.add('show');
+  document.getElementById(id).classList.add('show');
+}
+function closeSheets(){
+  document.getElementById('scrim').classList.remove('show');
+  document.querySelectorAll('.sheet').forEach(s=>s.classList.remove('show'));
+}
+function toast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(window._tt);
+  window._tt = setTimeout(()=>t.classList.remove('show'), 1800);
+}
 function copyText(t){
   navigator.clipboard && navigator.clipboard.writeText(t);
+  toast('Copied');
 }
 
-function filterRows(){
+function filterUsers(){
   const q = document.getElementById('searchBox').value.trim().toLowerCase();
-  const rows = document.querySelectorAll('#userRows tr');
+  const cards = document.querySelectorAll('#ulist .ucard');
   let visible = 0;
-  rows.forEach(r => {
-    const match = r.dataset.user.includes(q);
-    r.style.display = match ? '' : 'none';
+  cards.forEach(c => {
+    const match = c.dataset.user.includes(q);
+    c.style.display = match ? '' : 'none';
     if(match) visible++;
   });
+  document.getElementById('countPill').textContent = visible + ' users';
   document.getElementById('emptyMsg').style.display = (visible === 0) ? 'block' : 'none';
 }
 
+// -------------------------------------------------------------- API ----
 async function api(url, body){
   const res = await fetch(url, {
     method:'POST', headers:{'Content-Type':'application/json'},
@@ -1110,9 +1262,94 @@ async function api(url, body){
   return {status:res.status, data};
 }
 
+// ------------------------------------------------------- user sheet ----
+function openUserCard(el){
+  curUser = el.dataset.username;
+  document.getElementById('sh_name').textContent = el.dataset.username;
+  document.getElementById('sh_pw').textContent = el.dataset.password;
+  document.getElementById('sh_dot').style.color = el.dataset.online > 0 ? 'var(--signal)' : 'var(--faint)';
+  const ips = el.dataset.ips ? el.dataset.ips.split(',').filter(Boolean) : [];
+  document.getElementById('sh_sub').textContent =
+    `သက်တမ်း ${el.dataset.expire} · usage ${el.dataset.usage} · ${el.dataset.online} device online${ips.length ? ' · ' + ips.join(', ') : ''}`;
+  document.getElementById('u_msg').textContent = '';
+  openSheet('userSheet');
+}
+
+async function doKick(){
+  const msg = document.getElementById('u_msg');
+  const {data} = await api('/api/kick', {username: curUser});
+  if(data.ok){ toast('Kicked'); location.reload(); }
+  else { msg.textContent = data.error || 'Error'; msg.className = 'msg err'; }
+}
+async function doDelete(){
+  if(!confirm(`'${curUser}' ကို ဖျက်မှာ သေချာပါသလား?`)) return;
+  const msg = document.getElementById('u_msg');
+  const {data} = await api('/api/delete', {username: curUser});
+  if(data.ok){ toast('Deleted'); location.reload(); }
+  else { msg.textContent = data.error || 'Error'; msg.className = 'msg err'; }
+}
+
+// ------------------------------------------------------- renew sheet ----
+function openRenewSheet(){
+  document.getElementById('userSheet').classList.remove('show');
+  document.getElementById('rn_name').textContent = curUser;
+  document.getElementById('rn_msg').textContent = '';
+  document.getElementById('rn_days').value = 30;
+  setActiveChip(30);
+  updateNewDate(30);
+  openSheet('renewSheet');
+}
+function pickDays(d){ document.getElementById('rn_days').value = d; setActiveChip(d); updateNewDate(d); }
+function customDays(){
+  const d = parseInt(document.getElementById('rn_days').value || '0', 10);
+  setActiveChip(d); updateNewDate(d);
+}
+function setActiveChip(d){
+  document.querySelectorAll('.daychip').forEach(c=>{
+    c.classList.toggle('active', parseInt(c.dataset.d,10) === d);
+  });
+}
+function updateNewDate(d){
+  const dt = new Date();
+  dt.setDate(dt.getDate() + (parseInt(d,10) || 0));
+  document.getElementById('rn_newdate').textContent = dt.toISOString().slice(0,10);
+}
+async function confirmRenew(){
+  const msg = document.getElementById('rn_msg');
+  const days = document.getElementById('rn_days').value;
+  const {data} = await api('/api/renew', {username: curUser, days});
+  if(data.ok){ toast(`+${days} ရက် သက်တမ်းတိုးပြီး`); location.reload(); }
+  else { msg.textContent = data.error || 'Error'; msg.className = 'msg err'; }
+}
+
+// ------------------------------------------------------- limit sheet ----
+function openLimitSheet(){
+  document.getElementById('userSheet').classList.remove('show');
+  document.getElementById('lm_name').textContent = curUser;
+  const card = document.querySelector(`.ucard[data-username="${CSS.escape(curUser)}"]`);
+  document.getElementById('l_value').value = card ? card.dataset.limit : 1;
+  document.getElementById('l_msg').textContent = '';
+  openSheet('limitSheet');
+}
+async function doLimit(){
+  const msg = document.getElementById('l_msg');
+  const limit = document.getElementById('l_value').value;
+  const {data} = await api('/api/setlimit', {username: curUser, limit});
+  if(data.ok){ toast('Limit updated'); location.reload(); }
+  else { msg.textContent = data.error || 'Error'; msg.className = 'msg err'; }
+}
+
+// ------------------------------------------------------ create sheet ----
+function openCreateSheet(){
+  document.getElementById('c_user').value = '';
+  document.getElementById('c_pass').value = '';
+  document.getElementById('c_days').value = 30;
+  document.getElementById('c_limit').value = 1;
+  document.getElementById('c_msg').textContent = '';
+  openSheet('createSheet');
+}
 async function doCreate(){
   const msg = document.getElementById('c_msg');
-  msg.textContent = ''; msg.className = 'msg';
   const payload = {
     username: document.getElementById('c_user').value.trim(),
     password: document.getElementById('c_pass').value,
@@ -1120,53 +1357,11 @@ async function doCreate(){
     limit: document.getElementById('c_limit').value,
   };
   const {data} = await api('/api/create', payload);
-  if(data.ok){ location.reload(); }
+  if(data.ok){ toast('User created'); location.reload(); }
   else { msg.textContent = data.error || 'Error'; msg.className = 'msg err'; }
 }
 
-function openRenew(user){
-  curUser = user;
-  document.getElementById('r_user_label').textContent = user;
-  document.getElementById('r_msg').textContent = '';
-  openModal('renewModal');
-}
-async function doRenew(){
-  const msg = document.getElementById('r_msg');
-  const days = document.getElementById('r_days').value;
-  const {data} = await api('/api/renew', {username: curUser, days});
-  if(data.ok){ location.reload(); }
-  else { msg.textContent = data.error || 'Error'; msg.className = 'msg err'; }
-}
-
-function openLimit(user, current){
-  curUser = user;
-  document.getElementById('l_user_label').textContent = user;
-  document.getElementById('l_value').value = current;
-  document.getElementById('l_msg').textContent = '';
-  openModal('limitModal');
-}
-async function doLimit(){
-  const msg = document.getElementById('l_msg');
-  const limit = document.getElementById('l_value').value;
-  const {data} = await api('/api/setlimit', {username: curUser, limit});
-  if(data.ok){ location.reload(); }
-  else { msg.textContent = data.error || 'Error'; msg.className = 'msg err'; }
-}
-
-async function doKick(user){
-  if(!confirm(`'${user}' ရဲ့ session အားလုံး disconnect မှာ သေချာပါသလား?`)) return;
-  const {data} = await api('/api/kick', {username:user});
-  if(data.ok){ location.reload(); }
-  else { alert(data.error || 'Error'); }
-}
-
-async function doDelete(user){
-  if(!confirm(`'${user}' ကို ဖျက်မှာ သေချာပါသလား?`)) return;
-  const {data} = await api('/api/delete', {username:user});
-  if(data.ok){ location.reload(); }
-  else { alert(data.error || 'Error'); }
-}
-
+// ----------------------------------------------------- account sheet ----
 async function doChangePassword(){
   const msg = document.getElementById('pw_msg');
   const payload = {
@@ -1174,26 +1369,21 @@ async function doChangePassword(){
     password: document.getElementById('pw_pass').value,
   };
   const {data} = await api('/api/changepassword', payload);
-  if(data.ok){ alert('Password ပြောင်းပြီးပါပြီ - ပြန် login ဝင်ပါ'); location.href='/logout'; }
+  if(data.ok){ toast('Password changed'); location.href='/logout'; }
   else { msg.textContent = data.error || 'Error'; msg.className = 'msg err'; }
 }
 
 // ------------------------------------------------ live system monitor ----
-function barClass(pct){
-  if(pct >= 90) return 'danger';
-  if(pct >= 70) return 'warn';
-  return '';
-}
+function barClass(pct){ if(pct>=90) return 'danger'; if(pct>=70) return 'warn'; return ''; }
 function applyStat(prefix, pct){
-  const bar = document.getElementById(prefix + 'Bar');
-  const card = document.getElementById(prefix + 'Card');
+  const bar = document.getElementById(prefix+'Bar');
+  const card = document.getElementById(prefix+'Card');
   const cls = barClass(pct);
   bar.className = 'bar ' + cls;
   bar.querySelector('span').style.width = pct + '%';
-  card.className = 'syscard ' + cls;
-  document.getElementById(prefix + 'Pct').textContent = pct + '%';
+  card.className = 'sysmini ' + cls;
+  document.getElementById(prefix+'Pct').textContent = pct + '%';
 }
-
 async function refreshSysStats(){
   try{
     const res = await fetch('/api/sysstats');
@@ -1203,14 +1393,13 @@ async function refreshSysStats(){
     applyStat('cpu', s.cpu_percent);
     applyStat('ram', s.ram_percent);
     applyStat('disk', s.disk_percent);
-    document.getElementById('ramSub').textContent = s.ram_used_gb + ' GB / ' + s.ram_total_gb + ' GB';
-    document.getElementById('diskSub').textContent = s.disk_used_gb + ' GB / ' + s.disk_total_gb + ' GB';
+    document.getElementById('ramSub').textContent = s.ram_used_gb + 'GB/' + s.ram_total_gb + 'GB';
+    document.getElementById('diskSub').textContent = s.disk_used_gb + 'GB/' + s.disk_total_gb + 'GB';
 
     const row = document.getElementById('svcRow');
     row.innerHTML = data.services.map(svc => {
-      const cls = svc.up ? 'up' : (svc.known ? 'down' : 'unknown');
-      const txt = svc.up ? 'Active' : (svc.known ? 'Down' : 'N/A');
-      return `<span class="svcpill ${cls}"><span class="dot"></span>${svc.label} · ${txt}</span>`;
+      const cls = svc.up ? 'up' : (svc.known ? 'down' : '');
+      return `<span class="sigchip ${cls}"><span class="sigdot"></span>${svc.label}</span>`;
     }).join('');
   }catch(e){ /* ignore transient errors, keep last known state on screen */ }
 }
@@ -1220,6 +1409,7 @@ setInterval(refreshSysStats, 5000);
 </html>
 
 DASHEOF
+
 
 echo -e "${YELLOW}[*] detecting WS/SSL ports from existing install...${NC}"
 DETECTED_WS_PORT=$(grep -oP '(?<=^Environment=WS_PORT=)\d+' /etc/systemd/system/ws-proxy.service 2>/dev/null || true)
