@@ -1,0 +1,14 @@
+[Unit]
+Description=UDP Custom by ePro Dev. Team and modify by sslablk
+After=network.target
+
+[Service]
+User=root
+Type=simple
+ExecStart=/root/udp/udp-custom server
+WorkingDirectory=/root/udp/
+Restart=always
+RestartSec=2s
+
+[Install]
+WantedBy=default.target

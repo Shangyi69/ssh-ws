@@ -488,6 +488,37 @@ udpgw_status() {
     [[ "$ans" =~ ^[Yy]$ ]] && systemctl restart udpgw.service && echo -e "${GREEN}[+] restarted${NC}"
 }
 
+# Read-only status viewer for a separately/manually-installed "udp-custom"
+# binary (e.g. from noobconner21/UDP-Custom-Script). This menu does NOT
+# install, download, or run that binary — it only reports on a service
+# that may or may not already exist, and reminds the admin that user
+# accounts are still managed through this SSH-WS menu (options 1-4), not
+# through that project's own Adduser.sh/menu scripts.
+udp_custom_status() {
+    if ! systemctl list-unit-files 2>/dev/null | grep -q '^udp-custom\.service'; then
+        echo -e "${YELLOW}[!] udp-custom.service ကို ဒီ server ပေါ်မှာ တွေ့ခြင်းမရှိပါ${NC}"
+        echo "    (ကိုယ်တိုင် install လုပ်ထားရင် service name တခြားဖြစ်နိုင်ပါတယ်)"
+        return
+    fi
+    if systemctl is-active --quiet udp-custom.service; then
+        echo -e "${GREEN}[+] udp-custom.service : RUNNING${NC}"
+    else
+        echo -e "${RED}[!] udp-custom.service : STOPPED${NC}"
+    fi
+    if [[ -f /root/udp/config.json ]]; then
+        echo "--- /root/udp/config.json ---"
+        cat /root/udp/config.json
+        echo "------------------------------"
+    else
+        echo -e "${YELLOW}[!] /root/udp/config.json မတွေ့ပါ${NC}"
+    fi
+    echo -e "${CYAN}[i] User account တွေကို ဒီ SSH-WS menu ရဲ့ option 1-4 ကနေပဲ create/delete/renew လုပ်ပါ —${NC}"
+    echo -e "${CYAN}    udp-custom ရဲ့ auth mode 'passwords' က system login ကို ပြန်သုံးနိုင်ခြေရှိပေမဲ့${NC}"
+    echo -e "${CYAN}    binary source မရှိလို့ အာမခံမပေးနိုင်ပါ — ကိုယ်တိုင် test လုပ်ကြည့်ပါ${NC}"
+    read -rp "udp-custom.service restart လုပ်ချင်ပါသလား? (y/N): " ans
+    [[ "$ans" =~ ^[Yy]$ ]] && systemctl restart udp-custom.service && echo -e "${GREEN}[+] restarted${NC}"
+}
+
 while true; do
     clear
     echo -e "${CYAN}=========================================${NC}"
@@ -502,9 +533,10 @@ while true; do
     echo " 7) Set/Check Device Limit"
     echo " 8) Kick User (force disconnect all sessions)"
     echo " 9) UDP Custom (UDPGW) Status/Restart"
+    echo "10) udp-custom.service Status (read-only)"
     echo " 0) Exit"
     echo -e "${CYAN}=========================================${NC}"
-    read -rp "ရွေးပါ [0-9]: " opt
+    read -rp "ရွေးပါ [0-10]: " opt
     echo
     case "$opt" in
         1) create_user ;;
@@ -516,6 +548,7 @@ while true; do
         7) set_limit ;;
         8) kick_user ;;
         9) udpgw_status ;;
+        10) udp_custom_status ;;
         0) exit 0 ;;
         *) echo -e "${RED}မှားနေပါသည်${NC}" ;;
     esac
