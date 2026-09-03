@@ -1,80 +1,108 @@
-=========================================
- SSH-WS + UDP Custom — Setup Guide (VPS)
-=========================================
+# SSH-WS — SSH over WebSocket + Web Panel
 
-folder ၂ ခု ပါပါတယ်:
-  ssh-ws/       -> SSH+WebSocket server + Web Panel
-  udp-custom/   -> UDP Custom (binary + config + service, ePro Dev Team)
+A lightweight SSH-over-WebSocket tunneling service for Linux, with
+per-user device limits, account expiry, a web dashboard for day-to-day
+account management, and optional UDP Custom (UDPGW / ePro udp-custom)
+support.
 
------------------------------------------
-STEP 1 — VPS ပေါ်ကို upload
------------------------------------------
-ဒီ folder (ssh-ws-setup) တစ်ခုလုံးကို zip ချုပ်ပြီး FileZilla/WinSCP
-(သို့) hosting provider ရဲ့ File Manager နဲ့ VPS ရဲ့ /root/ ထဲ upload လုပ်ပါ။
+Dev: Phoe Shan
 
-  cd /root
-  unzip ssh-ws-setup.zip
+---
 
------------------------------------------
-STEP 2 — SSH-WS + Panel install
------------------------------------------
-  cd /root/ssh-ws-setup/ssh-ws
-  chmod +x install.sh install-panel.sh
-  bash install.sh 8880 443 7300
-  bash install-panel.sh 2053
+## 🚀 One-Click Install
 
-  (8880=WS port, 443=SSL port, 7300=UDPGW port(badvpn, optional),
-   2053=Panel port)
+Copy-paste this whole block into your VPS terminal (root):
 
-Install ပြီးရင် "menu" ရိုက်ပြီး user create လုပ်ပါ (option 1)
+```bash
+# ---- SSH-WS + Web Panel ----
+bash <(wget -qO- https://raw.githubusercontent.com/Shangyi69/ssh-ws/main/install-all.sh) 80 2053 443 7300
 
------------------------------------------
-STEP 3 — UDP Custom install
------------------------------------------
-NOTE: install-all.sh / install.sh only sets up SSH-WS + optional
-badvpn-udpgw (menu option 9). The genuine ePro udp-custom binary
-(menu option 10) is ALWAYS a separate step — it does not get installed
-automatically by install-all.sh, even if you passed a 4th port argument.
+# ---- UDP Custom (genuine ePro binary — always a separate step) ----
+mkdir -p /root/udp
+wget -O /root/udp/udp-custom  https://raw.githubusercontent.com/Shangyi69/ssh-ws/main/udp-custom
+wget -O /root/udp/config.json https://raw.githubusercontent.com/Shangyi69/ssh-ws/main/config.json
+wget -O /etc/systemd/system/udp-custom.service https://raw.githubusercontent.com/Shangyi69/ssh-ws/main/udp-custom.service
 
-  cd /root/ssh-ws-setup/udp-custom
-  bash install-udp-custom.sh
+chmod +x /root/udp/udp-custom
+systemctl daemon-reload
+systemctl enable --now udp-custom.service
+systemctl status udp-custom.service
+```
 
-  (ဒါက ဒီ folder ထဲက udp-custom/config.json/udp-custom.service ကို
-   /root/udp/ ထဲ copy လုပ်ပြီး chmod +x + systemd service အောင်မြင်စွာ
-   start လုပ်ပေးပါလိမ့်မယ် — internet ကနေ ဘာမှ download မလုပ်ပါ)
+Arguments for `install-all.sh`: `<WS_PORT> <PANEL_PORT> <SSL_PORT> <UDPGW_PORT>`
+— defaults: `8880 2053 443 7300` (edit the numbers above to change any of
+them).
 
-  Alternative — if working directly on the VPS from the GitHub repo
-  instead of this local zip:
-    mkdir -p /root/udp
-    wget -O /root/udp/udp-custom  https://raw.githubusercontent.com/Shangyi69/ssh-ws/main/udp-custom
-    wget -O /root/udp/config.json https://raw.githubusercontent.com/Shangyi69/ssh-ws/main/config.json
-    wget -O /etc/systemd/system/udp-custom.service https://raw.githubusercontent.com/Shangyi69/ssh-ws/main/udp-custom.service
-    chmod +x /root/udp/udp-custom
-    systemctl daemon-reload
-    systemctl enable --now udp-custom.service
+After both blocks finish, run `menu` to create your first user (option 1).
 
------------------------------------------
-STEP 4 — status ပြန်စစ်ချင်ရင်
------------------------------------------
-  menu
-  -> option 10 (udp-custom.service Status)
+> ⚠️ **Important:** `install-all.sh` only installs SSH-WS + the web panel
+> + optional `badvpn-udpgw` (`menu` option 9). The genuine ePro
+> `udp-custom` binary (`menu` option 10) is **always** a separate step —
+> it is never auto-installed by `install-all.sh`, even if you pass a 4th
+> port argument to it. Run the second command block above explicitly.
 
------------------------------------------
-Client app (HTTP Custom) setup
------------------------------------------
-  Method       : UDP Custom
-  Server       : <VPS IP>
-  Port         : 36712   (config.json ရဲ့ "listen" value)
-  Username/Pass: menu ကနေ create ထားတဲ့ SSH user (option 1)
+---
 
-  Note: "1-65535" ဆိုတဲ့ port range ကို config.json ထဲ ထည့်စရာ မလိုပါ —
-  listen port (36712) ချည်းသာ တကယ်အလုပ်လုပ်ပါတယ်။
+## What's included
 
------------------------------------------
-Error တက်ရင်
------------------------------------------
-  journalctl -u udp-custom -n 50 --no-pager
-  journalctl -u udp-custom -f              (live log, connect လုပ်နေတုန်း)
+| File | Purpose |
+|---|---|
+| `install.sh` | Installs the WebSocket→SSH proxy (`ws-proxy.py`), the account manager (`menu`), the device-limit/expiry enforcer daemon (`limiter.sh`), and optionally `badvpn-udpgw`. |
+| `install-panel.sh` | Installs the web dashboard (Flask app + systemd service) for managing accounts from a browser. |
+| `install-all.sh` | Convenience wrapper — runs `install.sh` then `install-panel.sh` in one go. |
+| `udp-custom` | Genuine ePro Dev Team UDP Custom binary — compatible with the HTTP Custom app's "UDP Custom" method. |
+| `config.json` | Config for `udp-custom` (listen port, buffers, auth mode). |
+| `udp-custom.service` | systemd unit for `udp-custom`. |
+| `install-udp-custom.sh` | Local installer for `udp-custom` — copies files from the same folder into `/root/udp/`, sets permissions, and starts the service. Use this if you downloaded the repo as a zip instead of fetching files individually via `wget`. |
 
-  ဒီ output တွေကို ကူးပြီး TROUBLESHOOTING.md ထဲက pattern တွေနဲ့
-  တိုက်ဆိုင်ကြည့်ပါ။
+---
+
+## Menu (`menu` command)
+
+| Option | Action |
+|---|---|
+| 1 | Create User |
+| 2 | Delete User |
+| 3 | Renew User |
+| 4 | User Info List |
+| 5 | Check Online + IP List |
+| 6 | Check Data Usage (GB) |
+| 7 | Set/Check Device Limit |
+| 8 | Kick User |
+| 9 | UDP Custom (UDPGW/badvpn) Status/Restart |
+| 10 | udp-custom.service Status (read-only) |
+
+---
+
+## Client app (HTTP Custom) setup
+
+```
+Method       : UDP Custom
+Server       : <VPS IP>
+Port         : 36712   (from config.json "listen")
+Username/Pass: created via `menu` option 1 — same account as SSH login
+```
+
+> Note: some UDP-Custom account cards print a "port 1-65535" line. This
+> is just display text, not a real feature — only the single `listen`
+> port in `config.json` actually works. See `TROUBLESHOOTING.md`.
+
+---
+
+## Something not working?
+
+See **[TROUBLESHOOTING.md](./TROUBLESHOOTING.md)** — covers the actual
+issues hit during real deployment and their fixes:
+- `udp-custom.service` stuck on STOPPED / config not found
+- `status=203/EXEC` crash loop (missing `chmod +x`)
+- Client stuck on "Connecting attempt 1, 2, 3…" — full 3-layer debug
+  path (firewall → packet capture → auth log)
+- The "port 1-65535" claim explained
+- `install-all.sh` not installing the genuine `udp-custom` service
+
+---
+
+## Contact / Credits
+
+- UDP Custom binary: ePro Dev Team
+- SSH-WS, panel, and integration: Phoe Shan
