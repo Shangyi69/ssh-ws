@@ -5,7 +5,7 @@
 #   bash <(wget -qO- raw.githubusercontent.com/Shangyi69/ssh-ws/main/install-all.sh) <WS_PORT> <PANEL_PORT> <SSL_PORT> <UDP_PORT>
 #
 # Example:
-#   bash <(wget -qO- raw.githubusercontent.com/Shangyi69/ssh-ws/main/install-all.sh) 80 2053 443 36712
+#   bash <(wget -qO- raw.githubusercontent.com/Shangyi69/ssh-ws/main/install-all.sh) 80 2053 443 7300
 #
 # $1 = WebSocket port for the SSH-WS service (default: 8880)
 # $2 = Port for the Web Panel (default: 2053)
@@ -18,7 +18,7 @@ REPO_BASE="https://raw.githubusercontent.com/Shangyi69/ssh-ws/main"
 WS_PORT="${1:-8880}"
 PANEL_PORT="${2:-2053}"
 SSL_PORT="${3:-}"
-UDP_PORT="${4:-36712}"
+UDP_PORT="${4:-7300}"
 [[ "$UDP_PORT" == "skip" ]] && UDP_PORT=""
 
 GREEN='\033[1;32m'; CYAN='\033[1;36m'; NC='\033[0m'

@@ -27,8 +27,10 @@ fi
 if [[ -n "$3" ]]; then
     UDP_PORT="$3"
 else
-    read -rp "UDP Custom (UDPGW) port ဘယ်ဟာသုံးမလဲ (e.g. 36712, blank = skip): " UDP_PORT
+    read -rp "UDP Custom (UDPGW) backend port ဘယ်ဟာသုံးမလဲ (Enter = 7300 default, 'skip' = UDP မလိုပါ): " UDP_PORT
 fi
+UDP_PORT="${UDP_PORT:-7300}"
+[[ "$UDP_PORT" == "skip" ]] && UDP_PORT=""
 
 echo -e "${YELLOW}[*] Package update / install...${NC}"
 apt update -y
@@ -343,7 +345,7 @@ create_user() {
     echo "    Limit    : $limit device(s)"
     if [[ -f "$UDP_PORT_FILE" ]]; then
         udp_port=$(cat "$UDP_PORT_FILE")
-        echo -e "${CYAN}    UDP Custom string : ${SERVER_IP}:${udp_port}@${user}:${pass}${NC}"
+        echo -e "${CYAN}    UDPGW Server : ${SERVER_IP}:${udp_port} (client app ရဲ့ 'UDPGW server' field ထဲ ဒါထည့်ပါ — port range 1-65535 ကို ဘာသုံးသုံး auto-redirect ဖြစ်ပါတယ်)${NC}"
     fi
 }
 
@@ -471,19 +473,17 @@ udpgw_status() {
         return
     fi
     if systemctl is-active --quiet udpgw.service; then
-        echo -e "${GREEN}[+] UDP Custom (udpgw) : RUNNING on port $port${NC}"
+        echo -e "${GREEN}[+] UDP Custom (udpgw) : RUNNING on backend port $port${NC}"
     else
         echo -e "${RED}[!] UDP Custom (udpgw) : STOPPED${NC}"
     fi
-    echo "Client (UDP Custom / HTTP Custom / HTTP Injector etc.):"
-    echo "  Server:Port : ${SERVER_IP}:$port"
-    read -rp "specific user ရဲ့ UDP Custom string ကြည့်ချင်ပါသလား? (y/N): " ans2
-    if [[ "$ans2" =~ ^[Yy]$ ]]; then
-        u=$(select_user) || return
-        [[ -z "$u" ]] && return
-        p=$(cat "$INFO_DIR/$u" 2>/dev/null)
-        echo -e "${CYAN}    UDP Custom string : ${SERVER_IP}:${port}@${u}:${p}${NC}"
+    if systemctl is-active --quiet udpgw-nat.service; then
+        echo -e "${GREEN}[+] Port-range redirect (1-65535 → $port) : ACTIVE${NC}"
+    else
+        echo -e "${YELLOW}[!] Port-range redirect : မထည့်ရသေးပါ (backend port ကို တိုက်ရိုက်ပဲ သုံးလို့ရပါတယ်)${NC}"
     fi
+    echo "Client app ('SSH' method + 'UDPGW server' field) settings:"
+    echo "  UDPGW Server : ${SERVER_IP}:${port}  (ဒါမှမဟုတ် 1-65535 ကြားက port ဘယ်ဟာမဆို)"
     read -rp "udpgw service restart လုပ်ချင်ပါသလား? (y/N): " ans
     [[ "$ans" =~ ^[Yy]$ ]] && systemctl restart udpgw.service && echo -e "${GREEN}[+] restarted${NC}"
 }
@@ -771,7 +771,49 @@ EOF
 
     if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
         ufw allow "${UDP_PORT}"/udp
+        ufw allow 1:65535/udp
     fi
+
+    echo -e "${YELLOW}[*] UDP port range (1-65535) ကို backend port ${UDP_PORT} ဆီ NAT redirect ချိတ်နေသည်...${NC}"
+    RESERVED_UDP_PORTS="22,${UDP_PORT}"
+    [[ -n "$WS_PORT" ]] && RESERVED_UDP_PORTS="${RESERVED_UDP_PORTS},${WS_PORT}"
+    [[ -n "$SSL_PORT" ]] && RESERVED_UDP_PORTS="${RESERVED_UDP_PORTS},${SSL_PORT}"
+
+    cat <<NATEOF > /usr/local/bin/udpgw-nat-apply.sh
+#!/bin/bash
+# Redirects the whole UDP port range (client apps often let the user pick
+# any port from 1-65535 to dodge ISP UDP throttling) to the real udpgw
+# backend port, while leaving a handful of reserved ports untouched.
+set -e
+iptables -t nat -N UDPGW_REDIRECT 2>/dev/null || true
+iptables -t nat -F UDPGW_REDIRECT
+for p in \$(echo "${RESERVED_UDP_PORTS}" | tr ',' ' '); do
+    iptables -t nat -A UDPGW_REDIRECT -p udp --dport "\$p" -j RETURN
+done
+iptables -t nat -A UDPGW_REDIRECT -p udp -j REDIRECT --to-port ${UDP_PORT}
+iptables -t nat -C PREROUTING -p udp -j UDPGW_REDIRECT 2>/dev/null || \\
+    iptables -t nat -A PREROUTING -p udp -j UDPGW_REDIRECT
+NATEOF
+    chmod +x /usr/local/bin/udpgw-nat-apply.sh
+    /usr/local/bin/udpgw-nat-apply.sh
+
+    cat <<EOF > /etc/systemd/system/udpgw-nat.service
+[Unit]
+Description=UDP Custom NAT port-range redirect (1-65535 -> ${UDP_PORT})
+After=network.target
+Before=udpgw.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/udpgw-nat-apply.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now udpgw-nat.service
 fi
 
 echo -e "${GREEN}=========================================${NC}"
@@ -781,7 +823,7 @@ if [[ -n "$SSL_PORT" ]]; then
     echo -e "${GREEN}  SSH+SSL port   : ${SSL_PORT}${NC}"
 fi
 if [[ -n "$UDP_PORT" ]]; then
-    echo -e "${GREEN}  UDP Custom port: ${UDP_PORT} (udpgw.service)${NC}"
+    echo -e "${GREEN}  UDPGW backend  : ${UDP_PORT} (client can use any port 1-65535, auto-redirected)${NC}"
 fi
 echo -e "${GREEN}  Menu command   : menu${NC}"
 echo -e "${GREEN}=========================================${NC}"
