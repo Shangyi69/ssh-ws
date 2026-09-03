@@ -24,10 +24,17 @@ else
     read -rp "SSH+SSL (TLS) port ဘယ်ဟာသုံးမလဲ (e.g. 443, blank = skip): " SSL_PORT
 fi
 
+if [[ -n "$3" ]]; then
+    UDP_PORT="$3"
+else
+    read -rp "UDP Custom (UDPGW) port ဘယ်ဟာသုံးမလဲ (e.g. 36712, blank = skip): " UDP_PORT
+fi
+
 echo -e "${YELLOW}[*] Package update / install...${NC}"
 apt update -y
 apt install -y openssh-server python3 iptables jq net-tools iproute2 cron >/dev/null
 [[ -n "$SSL_PORT" ]] && apt install -y stunnel4 openssl >/dev/null
+[[ -n "$UDP_PORT" ]] && apt install -y git cmake build-essential >/dev/null
 
 echo -e "${YELLOW}[*] sshd config...${NC}"
 sed -i 's/^#\?AllowTcpForwarding.*/AllowTcpForwarding yes/' /etc/ssh/sshd_config
@@ -282,9 +289,11 @@ cat <<'MENUEOF' > /usr/local/bin/menu
 LIMIT_DIR="/etc/ws-ssh/limit"
 INFO_DIR="/etc/ws-ssh/info"
 ONLINE_FILE="/var/run/ws-ssh/online_ips.json"
+UDP_PORT_FILE="/etc/ws-ssh/udp_port"
 GREEN='\033[1;32m'; RED='\033[1;31m'; YELLOW='\033[1;33m'; CYAN='\033[1;36m'; NC='\033[0m'
 
 mkdir -p "$LIMIT_DIR" "$INFO_DIR"
+SERVER_IP=$(curl -s -4 ifconfig.me || hostname -I | awk '{print $1}')
 
 pause() { read -rp "Enter ဖိ၍ menu သို့ ပြန်သွားရန်..." _; }
 
@@ -332,6 +341,10 @@ create_user() {
     echo "    Password : $pass"
     echo "    Expire   : $exp"
     echo "    Limit    : $limit device(s)"
+    if [[ -f "$UDP_PORT_FILE" ]]; then
+        udp_port=$(cat "$UDP_PORT_FILE")
+        echo -e "${CYAN}    UDP Custom string : ${SERVER_IP}:${udp_port}@${user}:${pass}${NC}"
+    fi
 }
 
 delete_user() {
@@ -450,6 +463,31 @@ kick_user() {
     echo -e "${GREEN}[+] '$user' ရဲ့ session အားလုံး kick ပြီးပါပြီ${NC}"
 }
 
+udpgw_status() {
+    local port
+    port=$(cat "$UDP_PORT_FILE" 2>/dev/null)
+    if [[ -z "$port" ]]; then
+        echo -e "${RED}[!] UDP Custom install မလုပ်ရသေးပါ${NC}"
+        return
+    fi
+    if systemctl is-active --quiet udpgw.service; then
+        echo -e "${GREEN}[+] UDP Custom (udpgw) : RUNNING on port $port${NC}"
+    else
+        echo -e "${RED}[!] UDP Custom (udpgw) : STOPPED${NC}"
+    fi
+    echo "Client (UDP Custom / HTTP Custom / HTTP Injector etc.):"
+    echo "  Server:Port : ${SERVER_IP}:$port"
+    read -rp "specific user ရဲ့ UDP Custom string ကြည့်ချင်ပါသလား? (y/N): " ans2
+    if [[ "$ans2" =~ ^[Yy]$ ]]; then
+        u=$(select_user) || return
+        [[ -z "$u" ]] && return
+        p=$(cat "$INFO_DIR/$u" 2>/dev/null)
+        echo -e "${CYAN}    UDP Custom string : ${SERVER_IP}:${port}@${u}:${p}${NC}"
+    fi
+    read -rp "udpgw service restart လုပ်ချင်ပါသလား? (y/N): " ans
+    [[ "$ans" =~ ^[Yy]$ ]] && systemctl restart udpgw.service && echo -e "${GREEN}[+] restarted${NC}"
+}
+
 while true; do
     clear
     echo -e "${CYAN}=========================================${NC}"
@@ -463,9 +501,10 @@ while true; do
     echo " 6) Check Data Usage (GB)"
     echo " 7) Set/Check Device Limit"
     echo " 8) Kick User (force disconnect all sessions)"
+    echo " 9) UDP Custom (UDPGW) Status/Restart"
     echo " 0) Exit"
     echo -e "${CYAN}=========================================${NC}"
-    read -rp "ရွေးပါ [0-8]: " opt
+    read -rp "ရွေးပါ [0-9]: " opt
     echo
     case "$opt" in
         1) create_user ;;
@@ -476,6 +515,7 @@ while true; do
         6) check_usage ;;
         7) set_limit ;;
         8) kick_user ;;
+        9) udpgw_status ;;
         0) exit 0 ;;
         *) echo -e "${RED}မှားနေပါသည်${NC}" ;;
     esac
@@ -691,11 +731,57 @@ if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
     ufw allow "${WS_PORT}"/tcp
 fi
 
+if [[ -n "$UDP_PORT" ]]; then
+    echo -e "${YELLOW}[*] UDP Custom (badvpn-udpgw) source ကို ယူပြီး build လုပ်နေသည်...${NC}"
+    UDP_BUILD_DIR="$(mktemp -d)"
+    git clone --depth 1 https://github.com/ambrop72/badvpn.git "$UDP_BUILD_DIR/badvpn" >/dev/null 2>&1
+    mkdir -p "$UDP_BUILD_DIR/badvpn/build"
+    (
+        cd "$UDP_BUILD_DIR/badvpn/build"
+        cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null
+        make -j"$(nproc)" >/dev/null
+    )
+    install -m 755 "$UDP_BUILD_DIR/badvpn/build/udpgw/badvpn-udpgw" /usr/local/bin/badvpn-udpgw
+    rm -rf "$UDP_BUILD_DIR"
+
+    echo "${UDP_PORT}" > /etc/ws-ssh/udp_port
+
+    cat <<EOF > /etc/systemd/system/udpgw.service
+[Unit]
+Description=UDP Custom (badvpn-udpgw) for SSH-WS
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/badvpn-udpgw \\
+    --listen-addr 0.0.0.0:${UDP_PORT} \\
+    --max-clients 1000 \\
+    --max-connections-for-client 10 \\
+    --loglevel notice
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now udpgw.service
+
+    if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
+        ufw allow "${UDP_PORT}"/udp
+    fi
+fi
+
 echo -e "${GREEN}=========================================${NC}"
 echo -e "${GREEN}  Install ပြီးပါပြီ!${NC}"
 echo -e "${GREEN}  WebSocket port : ${WS_PORT}${NC}"
 if [[ -n "$SSL_PORT" ]]; then
     echo -e "${GREEN}  SSH+SSL port   : ${SSL_PORT}${NC}"
+fi
+if [[ -n "$UDP_PORT" ]]; then
+    echo -e "${GREEN}  UDP Custom port: ${UDP_PORT} (udpgw.service)${NC}"
 fi
 echo -e "${GREEN}  Menu command   : menu${NC}"
 echo -e "${GREEN}=========================================${NC}"

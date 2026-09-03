@@ -63,6 +63,7 @@ WATCHED_SERVICES = [
     {"key": "ws_proxy", "label": "SSH+WS", "port": int(os.environ.get("WS_PORT", "8880")), "service": "ws-proxy"},
     {"key": "ws_ssl", "label": "SSH+SSL (443)", "port": int(os.environ.get("SSL_PORT", "443")), "service": "ws-ssl"},
     {"key": "ws_limiter", "label": "Limiter", "port": None, "service": "ws-limiter"},
+    {"key": "udpgw", "label": "UDP Custom", "port": (int(os.environ["UDP_PORT"]) if os.environ.get("UDP_PORT", "").isdigit() else None), "service": "udpgw"},
 ]
 
 app = Flask(__name__)
@@ -1411,9 +1412,10 @@ setInterval(refreshSysStats, 5000);
 DASHEOF
 
 
-echo -e "${YELLOW}[*] detecting WS/SSL ports from existing install...${NC}"
+echo -e "${YELLOW}[*] detecting WS/SSL/UDP ports from existing install...${NC}"
 DETECTED_WS_PORT=$(grep -oP '(?<=^Environment=WS_PORT=)\d+' /etc/systemd/system/ws-proxy.service 2>/dev/null || true)
 DETECTED_SSL_PORT=$(grep -oP '(?<=^accept = )\d+' /etc/stunnel/ws-ssl.conf 2>/dev/null || true)
+DETECTED_UDP_PORT=$(cat /etc/ws-ssh/udp_port 2>/dev/null || true)
 DETECTED_WS_PORT="${DETECTED_WS_PORT:-8880}"
 DETECTED_SSL_PORT="${DETECTED_SSL_PORT:-443}"
 
@@ -1428,6 +1430,7 @@ WorkingDirectory=/opt/ws-panel
 Environment=PANEL_PORT=${PANEL_PORT}
 Environment=WS_PORT=${DETECTED_WS_PORT}
 Environment=SSL_PORT=${DETECTED_SSL_PORT}
+Environment=UDP_PORT=${DETECTED_UDP_PORT}
 ExecStart=/usr/bin/python3 /opt/ws-panel/app.py
 Restart=always
 
