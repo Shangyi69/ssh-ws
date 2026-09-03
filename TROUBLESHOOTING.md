@@ -124,7 +124,47 @@ redirect, that has to be built separately with iptables `REDIRECT` rules
 
 ---
 
-## 5. Quick reference — useful diagnostic commands
+## 5. `install-all.sh` ran, but `menu` option 10 still says
+   "udp-custom.service ကို ဒီ server ပေါ်မှာ တွေ့ခြင်းမရှိပါ"
+
+**Symptom:** ran
+```bash
+bash <(wget -qO- raw.githubusercontent.com/Shangyi69/ssh-ws/main/install-all.sh) 80 2053 443
+```
+successfully, SSH-WS + panel work fine, but `menu` option 10
+(genuine `udp-custom.service` status) reports "not found".
+
+**Cause:** `install-all.sh` only installs two things —
+1. SSH-WS (`install.sh`)
+2. Web panel (`install-panel.sh`)
+
+If a 4th argument is given (or left to its default of `7300`), it also
+sets up **`badvpn-udpgw`** (`menu` option 9). That is a *different*
+service from the genuine ePro Dev Team `udp-custom` binary (`menu`
+option 10) — installing one does not install the other. `install-all.sh`
+deliberately does **not** fetch/run the `udp-custom` binary
+automatically; that step is separate on purpose.
+
+**Fix — install the genuine `udp-custom` service explicitly:**
+```bash
+mkdir -p /root/udp
+wget -O /root/udp/udp-custom  https://raw.githubusercontent.com/Shangyi69/ssh-ws/main/udp-custom
+wget -O /root/udp/config.json https://raw.githubusercontent.com/Shangyi69/ssh-ws/main/config.json
+wget -O /etc/systemd/system/udp-custom.service https://raw.githubusercontent.com/Shangyi69/ssh-ws/main/udp-custom.service
+
+chmod +x /root/udp/udp-custom
+ls -la /root/udp/udp-custom     # confirm the "x" permission is there
+
+systemctl daemon-reload
+systemctl enable --now udp-custom.service
+systemctl status udp-custom.service   # should show "active (running)"
+```
+(Or, if working from the local zip instead of the GitHub repo, just run
+`bash udp-custom/install-udp-custom.sh` — see main README.)
+
+---
+
+## 6. Quick reference — useful diagnostic commands
 
 ```bash
 # service status + logs
