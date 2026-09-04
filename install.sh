@@ -24,19 +24,10 @@ else
     read -rp "SSH+SSL (TLS) port ဘယ်ဟာသုံးမလဲ (e.g. 443, blank = skip): " SSL_PORT
 fi
 
-if [[ -n "$3" ]]; then
-    UDP_PORT="$3"
-else
-    read -rp "UDP Custom (UDPGW) backend port ဘယ်ဟာသုံးမလဲ (Enter = 7300 default, 'skip' = UDP မလိုပါ): " UDP_PORT
-fi
-UDP_PORT="${UDP_PORT:-7300}"
-[[ "$UDP_PORT" == "skip" ]] && UDP_PORT=""
-
 echo -e "${YELLOW}[*] Package update / install...${NC}"
 apt update -y
 apt install -y openssh-server python3 iptables jq net-tools iproute2 cron >/dev/null
 [[ -n "$SSL_PORT" ]] && apt install -y stunnel4 openssl >/dev/null
-[[ -n "$UDP_PORT" ]] && apt install -y git cmake build-essential >/dev/null
 
 echo -e "${YELLOW}[*] sshd config...${NC}"
 sed -i 's/^#\?AllowTcpForwarding.*/AllowTcpForwarding yes/' /etc/ssh/sshd_config
@@ -291,11 +282,9 @@ cat <<'MENUEOF' > /usr/local/bin/menu
 LIMIT_DIR="/etc/ws-ssh/limit"
 INFO_DIR="/etc/ws-ssh/info"
 ONLINE_FILE="/var/run/ws-ssh/online_ips.json"
-UDP_PORT_FILE="/etc/ws-ssh/udp_port"
 GREEN='\033[1;32m'; RED='\033[1;31m'; YELLOW='\033[1;33m'; CYAN='\033[1;36m'; NC='\033[0m'
 
 mkdir -p "$LIMIT_DIR" "$INFO_DIR"
-SERVER_IP=$(curl -s -4 ifconfig.me || hostname -I | awk '{print $1}')
 
 pause() { read -rp "Enter ဖိ၍ menu သို့ ပြန်သွားရန်..." _; }
 
@@ -343,10 +332,6 @@ create_user() {
     echo "    Password : $pass"
     echo "    Expire   : $exp"
     echo "    Limit    : $limit device(s)"
-    if [[ -f "$UDP_PORT_FILE" ]]; then
-        udp_port=$(cat "$UDP_PORT_FILE")
-        echo -e "${CYAN}    UDPGW Server : ${SERVER_IP}:${udp_port} (client app ရဲ့ 'UDPGW server' field ထဲ ဒါထည့်ပါ — port range 1-65535 ကို ဘာသုံးသုံး auto-redirect ဖြစ်ပါတယ်)${NC}"
-    fi
 }
 
 delete_user() {
@@ -465,60 +450,6 @@ kick_user() {
     echo -e "${GREEN}[+] '$user' ရဲ့ session အားလုံး kick ပြီးပါပြီ${NC}"
 }
 
-udpgw_status() {
-    local port
-    port=$(cat "$UDP_PORT_FILE" 2>/dev/null)
-    if [[ -z "$port" ]]; then
-        echo -e "${RED}[!] UDP Custom install မလုပ်ရသေးပါ${NC}"
-        return
-    fi
-    if systemctl is-active --quiet udpgw.service; then
-        echo -e "${GREEN}[+] UDP Custom (udpgw) : RUNNING on backend port $port${NC}"
-    else
-        echo -e "${RED}[!] UDP Custom (udpgw) : STOPPED${NC}"
-    fi
-    if systemctl is-active --quiet udpgw-nat.service; then
-        echo -e "${GREEN}[+] Port-range redirect (1-65535 → $port) : ACTIVE${NC}"
-    else
-        echo -e "${YELLOW}[!] Port-range redirect : မထည့်ရသေးပါ (backend port ကို တိုက်ရိုက်ပဲ သုံးလို့ရပါတယ်)${NC}"
-    fi
-    echo "Client app ('SSH' method + 'UDPGW server' field) settings:"
-    echo "  UDPGW Server : ${SERVER_IP}:${port}  (ဒါမှမဟုတ် 1-65535 ကြားက port ဘယ်ဟာမဆို)"
-    read -rp "udpgw service restart လုပ်ချင်ပါသလား? (y/N): " ans
-    [[ "$ans" =~ ^[Yy]$ ]] && systemctl restart udpgw.service && echo -e "${GREEN}[+] restarted${NC}"
-}
-
-# Read-only status viewer for a separately/manually-installed "udp-custom"
-# binary (e.g. from noobconner21/UDP-Custom-Script). This menu does NOT
-# install, download, or run that binary — it only reports on a service
-# that may or may not already exist, and reminds the admin that user
-# accounts are still managed through this SSH-WS menu (options 1-4), not
-# through that project's own Adduser.sh/menu scripts.
-udp_custom_status() {
-    if ! systemctl list-unit-files 2>/dev/null | grep -q '^udp-custom\.service'; then
-        echo -e "${YELLOW}[!] udp-custom.service ကို ဒီ server ပေါ်မှာ တွေ့ခြင်းမရှိပါ${NC}"
-        echo "    (ကိုယ်တိုင် install လုပ်ထားရင် service name တခြားဖြစ်နိုင်ပါတယ်)"
-        return
-    fi
-    if systemctl is-active --quiet udp-custom.service; then
-        echo -e "${GREEN}[+] udp-custom.service : RUNNING${NC}"
-    else
-        echo -e "${RED}[!] udp-custom.service : STOPPED${NC}"
-    fi
-    if [[ -f /root/udp/config.json ]]; then
-        echo "--- /root/udp/config.json ---"
-        cat /root/udp/config.json
-        echo "------------------------------"
-    else
-        echo -e "${YELLOW}[!] /root/udp/config.json မတွေ့ပါ${NC}"
-    fi
-    echo -e "${CYAN}[i] User account တွေကို ဒီ SSH-WS menu ရဲ့ option 1-4 ကနေပဲ create/delete/renew လုပ်ပါ —${NC}"
-    echo -e "${CYAN}    udp-custom ရဲ့ auth mode 'passwords' က system login ကို ပြန်သုံးနိုင်ခြေရှိပေမဲ့${NC}"
-    echo -e "${CYAN}    binary source မရှိလို့ အာမခံမပေးနိုင်ပါ — ကိုယ်တိုင် test လုပ်ကြည့်ပါ${NC}"
-    read -rp "udp-custom.service restart လုပ်ချင်ပါသလား? (y/N): " ans
-    [[ "$ans" =~ ^[Yy]$ ]] && systemctl restart udp-custom.service && echo -e "${GREEN}[+] restarted${NC}"
-}
-
 while true; do
     clear
     echo -e "${CYAN}=========================================${NC}"
@@ -532,11 +463,9 @@ while true; do
     echo " 6) Check Data Usage (GB)"
     echo " 7) Set/Check Device Limit"
     echo " 8) Kick User (force disconnect all sessions)"
-    echo " 9) UDP Custom (UDPGW) Status/Restart"
-    echo "10) udp-custom.service Status (read-only)"
     echo " 0) Exit"
     echo -e "${CYAN}=========================================${NC}"
-    read -rp "ရွေးပါ [0-10]: " opt
+    read -rp "ရွေးပါ [0-8]: " opt
     echo
     case "$opt" in
         1) create_user ;;
@@ -547,8 +476,6 @@ while true; do
         6) check_usage ;;
         7) set_limit ;;
         8) kick_user ;;
-        9) udpgw_status ;;
-        10) udp_custom_status ;;
         0) exit 0 ;;
         *) echo -e "${RED}မှားနေပါသည်${NC}" ;;
     esac
@@ -764,99 +691,11 @@ if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
     ufw allow "${WS_PORT}"/tcp
 fi
 
-if [[ -n "$UDP_PORT" ]]; then
-    echo -e "${YELLOW}[*] UDP Custom (badvpn-udpgw) source ကို ယူပြီး build လုပ်နေသည်...${NC}"
-    UDP_BUILD_DIR="$(mktemp -d)"
-    git clone --depth 1 https://github.com/ambrop72/badvpn.git "$UDP_BUILD_DIR/badvpn" >/dev/null 2>&1
-    mkdir -p "$UDP_BUILD_DIR/badvpn/build"
-    (
-        cd "$UDP_BUILD_DIR/badvpn/build"
-        cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null
-        make -j"$(nproc)" >/dev/null
-    )
-    install -m 755 "$UDP_BUILD_DIR/badvpn/build/udpgw/badvpn-udpgw" /usr/local/bin/badvpn-udpgw
-    rm -rf "$UDP_BUILD_DIR"
-
-    echo "${UDP_PORT}" > /etc/ws-ssh/udp_port
-
-    cat <<EOF > /etc/systemd/system/udpgw.service
-[Unit]
-Description=UDP Custom (badvpn-udpgw) for SSH-WS
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/badvpn-udpgw \\
-    --listen-addr 0.0.0.0:${UDP_PORT} \\
-    --max-clients 1000 \\
-    --max-connections-for-client 10 \\
-    --loglevel notice
-Restart=always
-RestartSec=3
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable --now udpgw.service
-
-    if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
-        ufw allow "${UDP_PORT}"/udp
-        ufw allow 1:65535/udp
-    fi
-
-    echo -e "${YELLOW}[*] UDP port range (1-65535) ကို backend port ${UDP_PORT} ဆီ NAT redirect ချိတ်နေသည်...${NC}"
-    RESERVED_UDP_PORTS="22,${UDP_PORT}"
-    [[ -n "$WS_PORT" ]] && RESERVED_UDP_PORTS="${RESERVED_UDP_PORTS},${WS_PORT}"
-    [[ -n "$SSL_PORT" ]] && RESERVED_UDP_PORTS="${RESERVED_UDP_PORTS},${SSL_PORT}"
-
-    cat <<NATEOF > /usr/local/bin/udpgw-nat-apply.sh
-#!/bin/bash
-# Redirects the whole UDP port range (client apps often let the user pick
-# any port from 1-65535 to dodge ISP UDP throttling) to the real udpgw
-# backend port, while leaving a handful of reserved ports untouched.
-set -e
-iptables -t nat -N UDPGW_REDIRECT 2>/dev/null || true
-iptables -t nat -F UDPGW_REDIRECT
-for p in \$(echo "${RESERVED_UDP_PORTS}" | tr ',' ' '); do
-    iptables -t nat -A UDPGW_REDIRECT -p udp --dport "\$p" -j RETURN
-done
-iptables -t nat -A UDPGW_REDIRECT -p udp -j REDIRECT --to-port ${UDP_PORT}
-iptables -t nat -C PREROUTING -p udp -j UDPGW_REDIRECT 2>/dev/null || \\
-    iptables -t nat -A PREROUTING -p udp -j UDPGW_REDIRECT
-NATEOF
-    chmod +x /usr/local/bin/udpgw-nat-apply.sh
-    /usr/local/bin/udpgw-nat-apply.sh
-
-    cat <<EOF > /etc/systemd/system/udpgw-nat.service
-[Unit]
-Description=UDP Custom NAT port-range redirect (1-65535 -> ${UDP_PORT})
-After=network.target
-Before=udpgw.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/udpgw-nat-apply.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable --now udpgw-nat.service
-fi
-
 echo -e "${GREEN}=========================================${NC}"
 echo -e "${GREEN}  Install ပြီးပါပြီ!${NC}"
 echo -e "${GREEN}  WebSocket port : ${WS_PORT}${NC}"
 if [[ -n "$SSL_PORT" ]]; then
     echo -e "${GREEN}  SSH+SSL port   : ${SSL_PORT}${NC}"
-fi
-if [[ -n "$UDP_PORT" ]]; then
-    echo -e "${GREEN}  UDPGW backend  : ${UDP_PORT} (client can use any port 1-65535, auto-redirected)${NC}"
 fi
 echo -e "${GREEN}  Menu command   : menu${NC}"
 echo -e "${GREEN}=========================================${NC}"

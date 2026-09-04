@@ -63,8 +63,12 @@ WATCHED_SERVICES = [
     {"key": "ws_proxy", "label": "SSH+WS", "port": int(os.environ.get("WS_PORT", "8880")), "service": "ws-proxy"},
     {"key": "ws_ssl", "label": "SSH+SSL (443)", "port": int(os.environ.get("SSL_PORT", "443")), "service": "ws-ssl"},
     {"key": "ws_limiter", "label": "Limiter", "port": None, "service": "ws-limiter"},
-    {"key": "udpgw", "label": "UDP Custom", "port": (int(os.environ["UDP_PORT"]) if os.environ.get("UDP_PORT", "").isdigit() else None), "service": "udpgw"},
+    {"key": "udp_custom", "label": "UDP Custom", "port": int(os.environ.get("UDP_PORT", "36712")), "service": "udp-custom"},
 ]
+
+UDP_DIR = "/root/udp"
+UDP_BIN = "/root/udp/udp-custom"
+UDP_CFG = "/root/udp/config.json"
 
 app = Flask(__name__)
 
@@ -672,6 +676,114 @@ def api_changepassword():
     return jsonify(ok=True)
 
 
+# ================================================================ UDP Custom ====
+
+def udp_config_load():
+    """Load /root/udp/config.json; return dict (with defaults if missing)."""
+    defaults = {"listen": ":36712", "stream_buffer": 33554432, "receive_buffer": 83886080,
+                "auth": {"mode": "passwords", "passwords": []}}
+    try:
+        with open(UDP_CFG) as f:
+            return json.load(f)
+    except Exception:
+        return defaults
+
+def udp_config_save(cfg):
+    os.makedirs(UDP_DIR, exist_ok=True)
+    with open(UDP_CFG, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+def udp_passwords():
+    """Return list of password strings from config."""
+    cfg = udp_config_load()
+    auth = cfg.get("auth", {})
+    if auth.get("mode") == "passwords":
+        return auth.get("passwords", [])
+    return []
+
+def udp_set_passwords(passwords):
+    cfg = udp_config_load()
+    cfg.setdefault("auth", {})
+    cfg["auth"]["mode"] = "passwords"
+    cfg["auth"]["passwords"] = passwords
+    udp_config_save(cfg)
+    # Restart service to apply
+    subprocess.run(["systemctl", "restart", "udp-custom"], capture_output=True)
+
+@app.route("/api/udp/status")
+@login_required
+def api_udp_status():
+    """Return udp-custom service status and current port."""
+    svc = subprocess.run(["systemctl", "is-active", "udp-custom"],
+                         capture_output=True, text=True).stdout.strip()
+    cfg = udp_config_load()
+    listen = cfg.get("listen", ":36712")
+    port = listen.split(":")[-1] if ":" in listen else listen
+    passwords = udp_passwords()
+    return jsonify(ok=True, active=(svc == "active"), port=port,
+                   passwords=passwords, user_count=len(passwords))
+
+@app.route("/api/udp/toggle", methods=["POST"])
+@login_required
+def api_udp_toggle():
+    """Start or stop udp-custom service."""
+    svc = subprocess.run(["systemctl", "is-active", "udp-custom"],
+                         capture_output=True, text=True).stdout.strip()
+    if svc == "active":
+        subprocess.run(["systemctl", "stop", "udp-custom"])
+        return jsonify(ok=True, active=False)
+    else:
+        subprocess.run(["systemctl", "start", "udp-custom"])
+        return jsonify(ok=True, active=True)
+
+@app.route("/api/udp/setport", methods=["POST"])
+@login_required
+def api_udp_setport():
+    data = request.get_json(force=True) or {}
+    try:
+        port = int(data.get("port", 0))
+        if not (1024 <= port <= 65535):
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="Port မှားနေပါသည် (1024-65535)"), 400
+    cfg = udp_config_load()
+    cfg["listen"] = f":{port}"
+    udp_config_save(cfg)
+    subprocess.run(["systemctl", "restart", "udp-custom"], capture_output=True)
+    return jsonify(ok=True, port=port)
+
+@app.route("/api/udp/adduser", methods=["POST"])
+@login_required
+def api_udp_adduser():
+    """Add a password to udp-custom auth list (uses SSH user's password)."""
+    data = request.get_json(force=True) or {}
+    user = (data.get("username") or "").strip()
+    password = (data.get("password") or "").strip()
+    if not user or not password:
+        return jsonify(ok=False, error="username/password ထည့်ပါ"), 400
+    # Store as "username:password" so we can identify per user
+    entry = f"{user}:{password}"
+    passwords = udp_passwords()
+    # Remove old entry for same user if exists
+    passwords = [p for p in passwords if not p.startswith(f"{user}:")]
+    passwords.append(entry)
+    udp_set_passwords(passwords)
+    return jsonify(ok=True)
+
+@app.route("/api/udp/removeuser", methods=["POST"])
+@login_required
+def api_udp_removeuser():
+    data = request.get_json(force=True) or {}
+    user = (data.get("username") or "").strip()
+    if not user:
+        return jsonify(ok=False, error="username ထည့်ပါ"), 400
+    passwords = udp_passwords()
+    passwords = [p for p in passwords if not p.startswith(f"{user}:")]
+    udp_set_passwords(passwords)
+    return jsonify(ok=True)
+
+# ============================================================ end UDP Custom ====
+
 app.secret_key = get_secret_key()
 
 # ---------------------------------------------------- auto-kick enforcer ----
@@ -1089,6 +1201,22 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
     </div>
     <div id="emptyMsg" class="empty" style="display:none;"><div class="big">🔍</div>ရှာဖွေမှုနှင့် ကိုက်ညီသော အသုံးပြုသူ မတွေ့ပါ</div>
 
+    <!-- UDP Custom section -->
+    <div class="section-head" style="margin-top:8px;">
+      <h2>UDP Custom</h2>
+      <span class="count-pill" id="udpUserCount">-</span>
+    </div>
+    <div class="stat" style="margin-bottom:10px; display:flex; align-items:center; justify-content:space-between; padding:14px 16px;">
+      <div>
+        <div style="font-size:12px; color:var(--muted);">Port</div>
+        <div class="mono" id="udpPort" style="font-size:16px; font-weight:600;">-</div>
+      </div>
+      <div style="display:flex; gap:10px; align-items:center;">
+        <button class="sbtn" onclick="openUdpPortSheet()" style="padding:9px 14px; font-size:12px;">Port ပြောင်း</button>
+        <button id="udpToggleBtn" onclick="doUdpToggle()" style="padding:9px 18px; border-radius:12px; border:none; font-weight:600; font-size:13px; cursor:pointer; background:var(--signal); color:#04211d;">-</button>
+      </div>
+    </div>
+
     <div class="credit">Dev Phoe Shan</div>
   </main>
 
@@ -1148,6 +1276,14 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
       <button class="sbtn danger" onclick="doDelete()">
         <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
         ဖျက်မည်
+      </button>
+      <button class="sbtn" onclick="doUdpAddUser()" id="udpAddBtn">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg>
+        UDP ထည့်
+      </button>
+      <button class="sbtn danger" onclick="doUdpRemoveUser()" id="udpRemoveBtn">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M8 12h8"/></svg>
+        UDP ဖျက်
       </button>
     </div>
     <div class="msg" id="u_msg"></div>
@@ -1212,6 +1348,19 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
     </div>
     <div class="msg" id="c_msg"></div>
     <button class="primary-btn" onclick="doCreate()">ဖန်တီးမည်</button>
+  </div>
+
+  <!-- UDP Port sheet -->
+  <div class="sheet" id="udpPortSheet">
+    <div class="grabber"></div>
+    <h3 style="font-family:'Space Grotesk',sans-serif;">UDP Custom Port</h3>
+    <div class="subtxt">UDP Custom server listen port ပြောင်းရန်</div>
+    <div class="field-in">
+      <label>Port (1024-65535)</label>
+      <input id="udp_port_val" type="number" value="36712">
+    </div>
+    <div class="msg" id="udp_port_msg"></div>
+    <button class="primary-btn" onclick="doUdpSetPort()">သိမ်းမည် + Restart</button>
   </div>
 
   <div class="toast" id="toast"></div>
@@ -1374,6 +1523,61 @@ async function doChangePassword(){
   else { msg.textContent = data.error || 'Error'; msg.className = 'msg err'; }
 }
 
+// -------------------------------------------------- UDP Custom control ----
+async function loadUdpStatus(){
+  try{
+    const res = await fetch('/api/udp/status');
+    const d = await res.json();
+    if(!d.ok) return;
+    document.getElementById('udpPort').textContent = d.port;
+    document.getElementById('udpUserCount').textContent = d.user_count + ' users';
+    const btn = document.getElementById('udpToggleBtn');
+    if(d.active){
+      btn.textContent = 'ရပ်မည်';
+      btn.style.background = 'var(--danger)';
+      btn.style.color = '#fff';
+    } else {
+      btn.textContent = 'စတင်မည်';
+      btn.style.background = 'var(--signal)';
+      btn.style.color = '#04211d';
+    }
+  }catch(e){}
+}
+async function doUdpToggle(){
+  const {data} = await api('/api/udp/toggle', {});
+  if(data.ok){ toast(data.active ? 'UDP Custom started' : 'UDP Custom stopped'); loadUdpStatus(); }
+}
+function openUdpPortSheet(){
+  const cur = document.getElementById('udpPort').textContent;
+  document.getElementById('udp_port_val').value = cur || 36712;
+  document.getElementById('udp_port_msg').textContent = '';
+  openSheet('udpPortSheet');
+}
+async function doUdpSetPort(){
+  const msg = document.getElementById('udp_port_msg');
+  const port = document.getElementById('udp_port_val').value;
+  const {data} = await api('/api/udp/setport', {port});
+  if(data.ok){ toast('Port updated → ' + data.port); closeSheets(); loadUdpStatus(); }
+  else { msg.textContent = data.error || 'Error'; msg.className = 'msg err'; }
+}
+async function doUdpAddUser(){
+  if(!curUser) return;
+  const card = document.querySelector(`.ucard[data-username="${CSS.escape(curUser)}"]`);
+  const pw = card ? card.dataset.password : '';
+  const msg = document.getElementById('u_msg');
+  const {data} = await api('/api/udp/adduser', {username: curUser, password: pw});
+  if(data.ok){ toast('UDP: ' + curUser + ' ထည့်ပြီး'); loadUdpStatus(); }
+  else { msg.textContent = data.error || 'Error'; msg.className = 'msg err'; }
+}
+async function doUdpRemoveUser(){
+  if(!curUser) return;
+  const msg = document.getElementById('u_msg');
+  const {data} = await api('/api/udp/removeuser', {username: curUser});
+  if(data.ok){ toast('UDP: ' + curUser + ' ဖျက်ပြီး'); loadUdpStatus(); }
+  else { msg.textContent = data.error || 'Error'; msg.className = 'msg err'; }
+}
+loadUdpStatus();
+
 // ------------------------------------------------ live system monitor ----
 function barClass(pct){ if(pct>=90) return 'danger'; if(pct>=70) return 'warn'; return ''; }
 function applyStat(prefix, pct){
@@ -1412,10 +1616,64 @@ setInterval(refreshSysStats, 5000);
 DASHEOF
 
 
-echo -e "${YELLOW}[*] detecting WS/SSL/UDP ports from existing install...${NC}"
+# ================================================================
+# UDP Custom Server ထည့်သွင်းခြင်း (system.zip မသုံးဘဲ binary ထဲသာ)
+# ================================================================
+echo -e "${YELLOW}[*] UDP Custom binary ထည့်သွင်းနေသည်...${NC}"
+mkdir -p /root/udp
+
+if [ ! -f /root/udp/udp-custom ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [ -f "${SCRIPT_DIR}/udp/udp-custom-linux-amd64" ]; then
+        cp "${SCRIPT_DIR}/udp/udp-custom-linux-amd64" /root/udp/udp-custom
+        echo -e "${GREEN}[+] local binary သုံး${NC}"
+    else
+        wget -q "https://github.com/Shangyi69/udp-custom-/raw/main/udp-custom-linux-amd64" \
+             -O /root/udp/udp-custom
+    fi
+    chmod +x /root/udp/udp-custom
+fi
+
+if [ ! -f /root/udp/config.json ]; then
+    cat > /root/udp/config.json <<'UDPCFG'
+{
+  "listen": ":36712",
+  "stream_buffer": 33554432,
+  "receive_buffer": 83886080,
+  "auth": {
+    "mode": "passwords",
+    "passwords": []
+  }
+}
+UDPCFG
+fi
+
+if [ ! -f /etc/systemd/system/udp-custom.service ]; then
+    cat > /etc/systemd/system/udp-custom.service <<'UDPSVC'
+[Unit]
+Description=UDP Custom Core Server
+After=network.target
+
+[Service]
+User=root
+Type=simple
+ExecStart=/root/udp/udp-custom server
+WorkingDirectory=/root/udp/
+Restart=always
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
+UDPSVC
+    systemctl daemon-reload
+    systemctl enable udp-custom
+fi
+
+echo -e "${GREEN}[+] UDP Custom binary ready${NC}"
+
+echo -e "${YELLOW}[*] detecting WS/SSL ports from existing install...${NC}"
 DETECTED_WS_PORT=$(grep -oP '(?<=^Environment=WS_PORT=)\d+' /etc/systemd/system/ws-proxy.service 2>/dev/null || true)
 DETECTED_SSL_PORT=$(grep -oP '(?<=^accept = )\d+' /etc/stunnel/ws-ssl.conf 2>/dev/null || true)
-DETECTED_UDP_PORT=$(cat /etc/ws-ssh/udp_port 2>/dev/null || true)
 DETECTED_WS_PORT="${DETECTED_WS_PORT:-8880}"
 DETECTED_SSL_PORT="${DETECTED_SSL_PORT:-443}"
 
@@ -1430,7 +1688,7 @@ WorkingDirectory=/opt/ws-panel
 Environment=PANEL_PORT=${PANEL_PORT}
 Environment=WS_PORT=${DETECTED_WS_PORT}
 Environment=SSL_PORT=${DETECTED_SSL_PORT}
-Environment=UDP_PORT=${DETECTED_UDP_PORT}
+Environment=UDP_PORT=36712
 ExecStart=/usr/bin/python3 /opt/ws-panel/app.py
 Restart=always
 
@@ -1454,4 +1712,5 @@ echo -e "${GREEN}  URL      : http://${IP}:${PANEL_PORT}${NC}"
 echo -e "${GREEN}  Username : admin${NC}"
 echo -e "${GREEN}  Password : admin123${NC}"
 echo -e "${YELLOW}  [!] Login ဝင်ပြီးတာနဲ့ \"Change Password\" ကနေ password ချက်ချင်းပြောင်းပါ${NC}"
+echo -e "${GREEN}  UDP   : port 36712 (panel ကနေ manage လုပ်နိုင်)${NC}"
 echo -e "${GREEN}=========================================${NC}"
