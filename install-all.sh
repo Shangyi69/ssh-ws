@@ -17,7 +17,7 @@ set -e
 REPO_BASE="https://raw.githubusercontent.com/Shangyi69/ssh-ws/main"
 WS_PORT="${1:-8880}"
 PANEL_PORT="${2:-2053}"
-SSL_PORT="${3:-}"
+SSL_PORT="${3:-443}"
 UDP_PORT="${4:-7300}"
 [[ "$UDP_PORT" == "skip" ]] && UDP_PORT=""
 
