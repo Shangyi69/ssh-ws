@@ -577,6 +577,8 @@ def api_create():
     with open(os.path.join(INFO_DIR, user), "w") as f:
         f.write(password)
     os.chmod(os.path.join(INFO_DIR, user), 0o600)
+    # ── UDP Custom sync ──────────────────────────────────────────────────
+    udp_sync_user(user, password)
     return jsonify(ok=True, expire=exp)
 
 
@@ -598,6 +600,8 @@ def api_delete():
         p = os.path.join(d, user)
         if os.path.exists(p):
             os.remove(p)
+    # ── UDP Custom sync ──────────────────────────────────────────────────
+    udp_remove_user(user)
     return jsonify(ok=True)
 
 
@@ -642,6 +646,11 @@ def api_renew():
             subprocess.run(cmd, capture_output=True)
         except FileNotFoundError:
             pass
+    # ── UDP Custom sync — renew လုပ်ရင် UDP ပြန်ထည့် ──────────────────
+    info_path = os.path.join(INFO_DIR, user)
+    if os.path.exists(info_path):
+        password = open(info_path).read().strip()
+        udp_sync_user(user, password)
     return jsonify(ok=True, expire=exp)
 
 
@@ -707,8 +716,21 @@ def udp_set_passwords(passwords):
     cfg["auth"]["mode"] = "passwords"
     cfg["auth"]["passwords"] = passwords
     udp_config_save(cfg)
-    # Restart service to apply
-    subprocess.run(["systemctl", "restart", "udp-custom"], capture_output=True)
+    subprocess.run(["systemctl", "reload-or-restart", "udp-custom"], capture_output=True)
+
+def udp_sync_user(username, password):
+    """Add or update username:password in UDP passwords list."""
+    passwords = udp_passwords()
+    passwords = [p for p in passwords if not p.startswith(f"{username}:")]
+    passwords.append(f"{username}:{password}")
+    udp_set_passwords(passwords)
+
+def udp_remove_user(username):
+    """Remove username from UDP passwords list (silent if not present)."""
+    passwords = udp_passwords()
+    new_passwords = [p for p in passwords if not p.startswith(f"{username}:")]
+    if new_passwords != passwords:
+        udp_set_passwords(new_passwords)
 
 @app.route("/api/udp/status")
 @login_required
@@ -782,9 +804,61 @@ def api_udp_removeuser():
     udp_set_passwords(passwords)
     return jsonify(ok=True)
 
+# ── UDP expiry watcher (background thread) ───────────────────────────────────
+# Every 30s: စစ်ကြည့် — expire ကုန်တဲ့ SSH user တွေကို UDP passwords[] ထဲကလည်း ဖျက်
+import threading
+
+def _udp_expire_watcher():
+    import time
+    while True:
+        try:
+            passwords = udp_passwords()
+            new_passwords = []
+            changed = False
+            for entry in passwords:
+                if ":" not in entry:
+                    new_passwords.append(entry)
+                    continue
+                uname = entry.split(":", 1)[0]
+                exp = get_expire(uname)
+                if is_expired(exp):
+                    changed = True  # ဖျက်မည်
+                else:
+                    new_passwords.append(entry)
+            if changed:
+                udp_set_passwords(new_passwords)
+        except Exception:
+            pass
+        time.sleep(30)
+
+_watcher = threading.Thread(target=_udp_expire_watcher, daemon=True)
+_watcher.start()
 # ============================================================ end UDP Custom ====
 
 app.secret_key = get_secret_key()
+
+# ── Startup: existing SSH users → UDP passwords[] seed ───────────────────────
+def _udp_seed_on_startup():
+    """Panel start တာနဲ့ expire မကုန်တဲ့ SSH user တွေကို UDP ထဲ seed လုပ်"""
+    try:
+        if not os.path.isdir(LIMIT_DIR):
+            return
+        passwords = []
+        for uname in os.listdir(LIMIT_DIR):
+            info_path = os.path.join(INFO_DIR, uname)
+            if not os.path.exists(info_path):
+                continue
+            exp = get_expire(uname)
+            if is_expired(exp):
+                continue
+            pw = open(info_path).read().strip()
+            if pw:
+                passwords.append(f"{uname}:{pw}")
+        udp_set_passwords(passwords)
+    except Exception:
+        pass
+
+_udp_seed_on_startup()
 
 # ---------------------------------------------------- auto-kick enforcer ----
 # Runs in the background for as long as the panel process is alive (the
