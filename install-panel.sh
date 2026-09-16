@@ -115,33 +115,48 @@ def login_required(fn):
     return wrapper
 
 
-def get_expire(user):
+def get_expire_epoch(user):
+    """Read the raw account-expiry date straight from /etc/shadow (field 8,
+    days since epoch). This is locale-independent — unlike parsing `chage
+    -l`'s human-readable date, which silently breaks (and makes accounts
+    look like they never expire) whenever the server's locale/date format
+    doesn't match the exact string this code expects."""
     try:
-        out = subprocess.run(["chage", "-l", user], capture_output=True, text=True, timeout=5).stdout
-        for line in out.splitlines():
-            if line.strip().startswith("Account expires"):
-                val = line.split(":", 1)[1].strip()
-                return val
+        with open("/etc/shadow") as f:
+            for line in f:
+                parts = line.rstrip("\n").split(":")
+                if parts and parts[0] == user:
+                    if len(parts) > 7 and parts[7].strip():
+                        try:
+                            return int(parts[7]) * 86400
+                        except ValueError:
+                            return None
+                    return None
     except Exception:
         pass
-    return "-"
+    return None
 
 
-def is_expired(expire_str):
-    """Return True if account is expired."""
-    if not expire_str or expire_str in ("-", "never"):
+def get_expire(user):
+    """Human-readable expiry date for display in the UI."""
+    exp_epoch = get_expire_epoch(user)
+    if exp_epoch is None:
+        return "-"
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(exp_epoch, tz=timezone.utc).strftime("%b %d, %Y")
+
+
+def is_expired(user):
+    """Return True if the given user's account is expired.
+
+    Reads /etc/shadow directly (via get_expire_epoch) instead of parsing a
+    formatted date string, so this can never silently mis-parse and get
+    stuck reporting "not expired" forever.
+    """
+    exp_epoch = get_expire_epoch(user)
+    if exp_epoch is None:
         return False
-    try:
-        from datetime import datetime
-        exp = datetime.strptime(expire_str.strip(), "%b %d, %Y")
-        return exp < datetime.now()
-    except Exception:
-        try:
-            from datetime import datetime
-            exp = datetime.strptime(expire_str.strip(), "%Y-%m-%d")
-            return exp < datetime.now()
-        except Exception:
-            return False
+    return exp_epoch <= time.time()
 
 
 ONLINE_FILE = "/var/run/ws-ssh/online_ips.json"
@@ -334,7 +349,7 @@ def list_users():
                 "username": user,
                 "password": password,
                 "expire": exp,
-                "expired": is_expired(exp),
+                "expired": is_expired(user),
                 "limit": limit,
                 "online": get_online_count(user),
                 "online_ips": get_online_ips(user),
@@ -514,6 +529,9 @@ def logout():
 @login_required
 def dashboard():
     users = list_users()
+    udp_member_names = {p.split(":", 1)[0] for p in udp_passwords() if ":" in p}
+    for u in users:
+        u["in_udp"] = u["username"] in udp_member_names
     stats = {
         "total": len(users),
         "online": sum(1 for u in users if u["online"] > 0),
@@ -577,6 +595,8 @@ def api_create():
     with open(os.path.join(INFO_DIR, user), "w") as f:
         f.write(password)
     os.chmod(os.path.join(INFO_DIR, user), 0o600)
+    # ── UDP Custom sync ──────────────────────────────────────────────────
+    udp_sync_user(user, password)
     return jsonify(ok=True, expire=exp)
 
 
@@ -598,6 +618,8 @@ def api_delete():
         p = os.path.join(d, user)
         if os.path.exists(p):
             os.remove(p)
+    # ── UDP Custom sync ──────────────────────────────────────────────────
+    udp_remove_user(user)
     return jsonify(ok=True)
 
 
@@ -642,6 +664,11 @@ def api_renew():
             subprocess.run(cmd, capture_output=True)
         except FileNotFoundError:
             pass
+    # ── UDP Custom sync — renew လုပ်ရင် UDP ပြန်ထည့် ──────────────────
+    info_path = os.path.join(INFO_DIR, user)
+    if os.path.exists(info_path):
+        password = open(info_path).read().strip()
+        udp_sync_user(user, password)
     return jsonify(ok=True, expire=exp)
 
 
@@ -707,8 +734,21 @@ def udp_set_passwords(passwords):
     cfg["auth"]["mode"] = "passwords"
     cfg["auth"]["passwords"] = passwords
     udp_config_save(cfg)
-    # Restart service to apply
-    subprocess.run(["systemctl", "restart", "udp-custom"], capture_output=True)
+    subprocess.run(["systemctl", "reload-or-restart", "udp-custom"], capture_output=True)
+
+def udp_sync_user(username, password):
+    """Add or update username:password in UDP passwords list."""
+    passwords = udp_passwords()
+    passwords = [p for p in passwords if not p.startswith(f"{username}:")]
+    passwords.append(f"{username}:{password}")
+    udp_set_passwords(passwords)
+
+def udp_remove_user(username):
+    """Remove username from UDP passwords list (silent if not present)."""
+    passwords = udp_passwords()
+    new_passwords = [p for p in passwords if not p.startswith(f"{username}:")]
+    if new_passwords != passwords:
+        udp_set_passwords(new_passwords)
 
 @app.route("/api/udp/status")
 @login_required
@@ -782,9 +822,59 @@ def api_udp_removeuser():
     udp_set_passwords(passwords)
     return jsonify(ok=True)
 
+# ── UDP expiry watcher (background thread) ───────────────────────────────────
+# Every 30s: စစ်ကြည့် — expire ကုန်တဲ့ SSH user တွေကို UDP passwords[] ထဲကလည်း ဖျက်
+import threading
+
+def _udp_expire_watcher():
+    import time
+    while True:
+        try:
+            passwords = udp_passwords()
+            new_passwords = []
+            changed = False
+            for entry in passwords:
+                if ":" not in entry:
+                    new_passwords.append(entry)
+                    continue
+                uname = entry.split(":", 1)[0]
+                if is_expired(uname):
+                    changed = True  # ဖျက်မည်
+                else:
+                    new_passwords.append(entry)
+            if changed:
+                udp_set_passwords(new_passwords)
+        except Exception:
+            pass
+        time.sleep(30)
+
+_watcher = threading.Thread(target=_udp_expire_watcher, daemon=True)
+_watcher.start()
 # ============================================================ end UDP Custom ====
 
 app.secret_key = get_secret_key()
+
+# ── Startup: existing SSH users → UDP passwords[] seed ───────────────────────
+def _udp_seed_on_startup():
+    """Panel start တာနဲ့ expire မကုန်တဲ့ SSH user တွေကို UDP ထဲ seed လုပ်"""
+    try:
+        if not os.path.isdir(LIMIT_DIR):
+            return
+        passwords = []
+        for uname in os.listdir(LIMIT_DIR):
+            info_path = os.path.join(INFO_DIR, uname)
+            if not os.path.exists(info_path):
+                continue
+            if is_expired(uname):
+                continue
+            pw = open(info_path).read().strip()
+            if pw:
+                passwords.append(f"{uname}:{pw}")
+        udp_set_passwords(passwords)
+    except Exception:
+        pass
+
+_udp_seed_on_startup()
 
 # ---------------------------------------------------- auto-kick enforcer ----
 # Runs in the background for as long as the panel process is alive (the
@@ -1217,6 +1307,33 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
       </div>
     </div>
 
+    <div class="ulist" id="udpUlist">
+      {% for u in users %}
+      <div class="ucard {{ 'expired' if u.expired else '' }}"
+           data-username="{{ u.username }}"
+           data-password="{{ u.password }}"
+           data-inudp="{{ 'true' if u.in_udp else 'false' }}">
+        <div class="urow-top">
+          <div class="uid">
+            <span class="dot {{ 'on' if u.in_udp else '' }}"></span>
+            <span class="uname">{{ u.username }}</span>
+          </div>
+          <button class="sbtn" onclick="toggleUdpMember(this)" style="padding:6px 12px; font-size:12px; border-radius:10px; border:none; cursor:pointer; background:{{ 'var(--danger)' if u.in_udp else 'var(--signal)' }}; color:{{ '#fff' if u.in_udp else '#04211d' }};">
+            {{ 'ဖြုတ်မည်' if u.in_udp else 'ထည့်မည်' }}
+          </button>
+        </div>
+        <div class="urow-meta">
+          {% if u.expired %}
+            <span class="pill expired">EXPIRED · {{ u.expire }}</span>
+          {% else %}
+            <span class="pill">{{ u.expire }}</span>
+          {% endif %}
+          {% if u.in_udp %}<span class="pill online">UDP ✓ active</span>{% else %}<span class="pill">UDP ✕ not added</span>{% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+
     <div class="credit">Dev Phoe Shan</div>
   </main>
 
@@ -1577,6 +1694,25 @@ async function doUdpRemoveUser(){
   else { msg.textContent = data.error || 'Error'; msg.className = 'msg err'; }
 }
 loadUdpStatus();
+
+// -------------------------------------------- UDP per-user control ----
+async function toggleUdpMember(btn){
+  const card = btn.closest('.ucard');
+  const username = card.dataset.username;
+  const password = card.dataset.password;
+  const inUdp = card.dataset.inudp === 'true';
+  btn.disabled = true;
+  const {data} = inUdp
+    ? await api('/api/udp/removeuser', {username})
+    : await api('/api/udp/adduser', {username, password});
+  if(data.ok){
+    toast(inUdp ? username + ' UDP ဖြုတ်ပြီး' : username + ' UDP ထည့်ပြီး');
+    location.reload();
+  } else {
+    btn.disabled = false;
+    toast(data.error || 'Error');
+  }
+}
 
 // ------------------------------------------------ live system monitor ----
 function barClass(pct){ if(pct>=90) return 'danger'; if(pct>=70) return 'warn'; return ''; }
