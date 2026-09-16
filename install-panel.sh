@@ -528,6 +528,7 @@ def logout():
 @app.route("/")
 @login_required
 def dashboard():
+    udp_purge_expired()
     users = list_users()
     udp_member_names = {p.split(":", 1)[0] for p in udp_passwords() if ":" in p}
     for u in users:
@@ -742,6 +743,38 @@ def udp_sync_user(username, password):
     passwords = [p for p in passwords if not p.startswith(f"{username}:")]
     passwords.append(f"{username}:{password}")
     udp_set_passwords(passwords)
+    udp_schedule_expiry(username)
+
+# ── Exact-moment expiry scheduler ────────────────────────────────────────────
+# Polling (background watcher / page-load purge) closes the gap fast, but it
+# still waits for the next tick. This schedules a one-shot timer that fires
+# at the precise second the SSH account's expiry date arrives, so UDP access
+# is pulled at the *same instant* the SSH account itself becomes invalid —
+# not up to N seconds later.
+_udp_expiry_timers = {}
+_udp_expiry_lock = threading.Lock()
+
+def udp_schedule_expiry(username):
+    with _udp_expiry_lock:
+        old = _udp_expiry_timers.pop(username, None)
+        if old:
+            old.cancel()
+        exp_epoch = get_expire_epoch(username)
+        if exp_epoch is None:
+            return  # account never expires — nothing to schedule
+        delay = exp_epoch - time.time()
+        if delay <= 0:
+            udp_remove_user(username)
+            return
+        t = threading.Timer(delay, _udp_expiry_fire, args=[username])
+        t.daemon = True
+        _udp_expiry_timers[username] = t
+        t.start()
+
+def _udp_expiry_fire(username):
+    with _udp_expiry_lock:
+        _udp_expiry_timers.pop(username, None)
+    udp_remove_user(username)
 
 def udp_remove_user(username):
     """Remove username from UDP passwords list (silent if not present)."""
@@ -750,10 +783,36 @@ def udp_remove_user(username):
     if new_passwords != passwords:
         udp_set_passwords(new_passwords)
 
+def udp_purge_expired():
+    """Remove any already-expired user's entry from the UDP Custom
+    passwords list right now, restarting udp-custom if anything changed.
+    This is called synchronously on every dashboard/status load (not just
+    every 30s from the background watcher) so what the UI shows and what
+    udp-custom will actually authenticate can never drift apart — the
+    30s-only version could show a user as removed on a stale page while
+    the live config (and an already-connected client) still worked for up
+    to 30 more seconds."""
+    passwords = udp_passwords()
+    kept = []
+    changed = False
+    for entry in passwords:
+        if ":" not in entry:
+            kept.append(entry)
+            continue
+        uname = entry.split(":", 1)[0]
+        if is_expired(uname):
+            changed = True
+        else:
+            kept.append(entry)
+    if changed:
+        udp_set_passwords(kept)
+    return changed
+
 @app.route("/api/udp/status")
 @login_required
 def api_udp_status():
     """Return udp-custom service status and current port."""
+    udp_purge_expired()
     svc = subprocess.run(["systemctl", "is-active", "udp-custom"],
                          capture_output=True, text=True).stdout.strip()
     cfg = udp_config_load()
@@ -801,6 +860,8 @@ def api_udp_adduser():
     password = (data.get("password") or "").strip()
     if not user or not password:
         return jsonify(ok=False, error="username/password ထည့်ပါ"), 400
+    if is_expired(user):
+        return jsonify(ok=False, error="'" + user + "' ရဲ့ account သက်တမ်းကုန်နေပါသည် — renew လုပ်ပြီးမှ UDP ထည့်ပါ"), 400
     # Store as "username:password" so we can identify per user
     entry = f"{user}:{password}"
     passwords = udp_passwords()
@@ -808,6 +869,7 @@ def api_udp_adduser():
     passwords = [p for p in passwords if not p.startswith(f"{user}:")]
     passwords.append(entry)
     udp_set_passwords(passwords)
+    udp_schedule_expiry(user)
     return jsonify(ok=True)
 
 @app.route("/api/udp/removeuser", methods=["POST"])
@@ -830,23 +892,10 @@ def _udp_expire_watcher():
     import time
     while True:
         try:
-            passwords = udp_passwords()
-            new_passwords = []
-            changed = False
-            for entry in passwords:
-                if ":" not in entry:
-                    new_passwords.append(entry)
-                    continue
-                uname = entry.split(":", 1)[0]
-                if is_expired(uname):
-                    changed = True  # ဖျက်မည်
-                else:
-                    new_passwords.append(entry)
-            if changed:
-                udp_set_passwords(new_passwords)
+            udp_purge_expired()
         except Exception:
             pass
-        time.sleep(30)
+        time.sleep(10)
 
 _watcher = threading.Thread(target=_udp_expire_watcher, daemon=True)
 _watcher.start()
@@ -870,6 +919,7 @@ def _udp_seed_on_startup():
             pw = open(info_path).read().strip()
             if pw:
                 passwords.append(f"{uname}:{pw}")
+                udp_schedule_expiry(uname)
         udp_set_passwords(passwords)
     except Exception:
         pass
