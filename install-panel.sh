@@ -729,13 +729,32 @@ def udp_passwords():
         return auth.get("passwords", [])
     return []
 
+_udp_last_restart_error = None
+
+def udp_restart_service():
+    """Force udp-custom to fully stop and start (this binary has no
+    ExecReload, so a plain reload/reload-or-restart can silently no-op on
+    some systemd versions instead of actually cycling the process — which
+    is exactly the kind of failure that leaves stale/expired credentials
+    live in memory while the config file on disk already looks correct).
+    Any failure is captured in _udp_last_restart_error so the panel can
+    surface it instead of quietly pretending it worked."""
+    global _udp_last_restart_error
+    stop = subprocess.run(["systemctl", "stop", "udp-custom"], capture_output=True, text=True)
+    start = subprocess.run(["systemctl", "start", "udp-custom"], capture_output=True, text=True)
+    if start.returncode != 0:
+        _udp_last_restart_error = (start.stderr or start.stdout or "systemctl start failed").strip()
+    else:
+        _udp_last_restart_error = None
+    return start.returncode == 0
+
 def udp_set_passwords(passwords):
     cfg = udp_config_load()
     cfg.setdefault("auth", {})
     cfg["auth"]["mode"] = "passwords"
     cfg["auth"]["passwords"] = passwords
     udp_config_save(cfg)
-    subprocess.run(["systemctl", "reload-or-restart", "udp-custom"], capture_output=True)
+    udp_restart_service()
 
 def udp_sync_user(username, password):
     """Add or update username:password in UDP passwords list."""
@@ -820,7 +839,8 @@ def api_udp_status():
     port = listen.split(":")[-1] if ":" in listen else listen
     passwords = udp_passwords()
     return jsonify(ok=True, active=(svc == "active"), port=port,
-                   passwords=passwords, user_count=len(passwords))
+                   passwords=passwords, user_count=len(passwords),
+                   restart_error=_udp_last_restart_error)
 
 @app.route("/api/udp/toggle", methods=["POST"])
 @login_required
@@ -1356,6 +1376,7 @@ cat <<'DASHEOF' > /opt/ws-panel/templates/dashboard.html
         <button id="udpToggleBtn" onclick="doUdpToggle()" style="padding:9px 18px; border-radius:12px; border:none; font-weight:600; font-size:13px; cursor:pointer; background:var(--signal); color:#04211d;">-</button>
       </div>
     </div>
+    <div id="udpRestartWarn" style="display:none; margin-bottom:10px; padding:10px 14px; border-radius:12px; background:rgba(240,82,95,.12); border:1px solid rgba(240,82,95,.4); color:#f0525f; font-size:12.5px;"></div>
 
     <div class="ulist" id="udpUlist">
       {% for u in users %}
@@ -1698,6 +1719,13 @@ async function loadUdpStatus(){
     if(!d.ok) return;
     document.getElementById('udpPort').textContent = d.port;
     document.getElementById('udpUserCount').textContent = d.user_count + ' users';
+    const warn = document.getElementById('udpRestartWarn');
+    if(d.restart_error){
+      warn.style.display = 'block';
+      warn.textContent = '⚠ udp-custom service ကို ပြန် start လို့ မရပါ — backend က UDP user list နဲ့ sync မဖြစ်နေပါဘူး: ' + d.restart_error;
+    } else {
+      warn.style.display = 'none';
+    }
     const btn = document.getElementById('udpToggleBtn');
     if(d.active){
       btn.textContent = 'ရပ်မည်';
