@@ -150,22 +150,30 @@ def get_online_count(user):
     try:
         out = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=5).stdout
         needle = f"sshd: {user}"
-        return sum(1 for line in out.splitlines() if needle in line and "grep" not in line and "[priv]" not in line)
+        ssh_count = sum(1 for line in out.splitlines() if needle in line and "grep" not in line and "[priv]" not in line)
     except Exception:
-        return 0
+        ssh_count = 0
+    with UDP_SESSIONS_LOCK:
+        udp_count = len(UDP_SESSIONS.get(user, []))
+    return ssh_count + udp_count
 
 
 def get_online_ips(user):
-    """Return list of real client IPs from limiter's online_ips.json"""
+    """Return list of real client IPs: SSH-WS sessions from limiter's
+    online_ips.json, merged with UDP-Custom sessions tracked by
+    udp_journal_watcher() (see below — best-effort, no stats API exists)."""
+    ips = []
     try:
-        if not os.path.exists(ONLINE_FILE):
-            return []
-        with open(ONLINE_FILE) as f:
-            data = json.load(f)
-        sessions = data.get(user, [])
-        return [s.get("ip", "unknown") for s in sessions if s.get("ip") and s.get("ip") != "unknown"]
+        if os.path.exists(ONLINE_FILE):
+            with open(ONLINE_FILE) as f:
+                data = json.load(f)
+            sessions = data.get(user, [])
+            ips += [s.get("ip", "unknown") for s in sessions if s.get("ip") and s.get("ip") != "unknown"]
     except Exception:
-        return []
+        pass
+    with UDP_SESSIONS_LOCK:
+        ips += [s["ip"] for s in UDP_SESSIONS.get(user, [])]
+    return ips
 
 
 # --------------------------------------------------------------- traffic ----
@@ -795,6 +803,81 @@ def api_udp_removeuser():
 
 app.secret_key = get_secret_key()
 
+# ------------------------------------------------- udp-custom online status ----
+# UDP-Custom (v1.4, ePro Dev Team) exposes no stats/API and its journald log
+# only carries the username on "Client connected" — the matching
+# "Client disconnected" line has ONLY the source IP, no username. So exact
+# per-user session accounting is not possible from the outside; this is a
+# best-effort approximation, not a byte-accurate counter:
+#   - on "connected" we record a session under {user: [{ip, connected_at}]}
+#   - on "disconnected" we don't know WHICH user closed — we pop the OLDEST
+#     still-open session for that same source IP (FIFO). This is correct in
+#     the common case of one active device per IP, but can misattribute if
+#     the same public IP has two different users connected at once (e.g.
+#     shared NAT/office wifi).
+#   - every session self-expires after UDP_SESSION_TTL seconds even with no
+#     matching disconnect line, so a missed/malformed log line can never
+#     wedge a user "online" forever.
+# GB/byte usage for UDP-Custom users is NOT tracked — there is no per-user
+# byte counter available anywhere (binary has no stats API, and iptables
+# uid-owner rules can't see it either since all UDP traffic is forwarded by
+# the single root-owned udp-custom process, not per-user processes).
+UDP_SESSIONS_LOCK = threading.Lock()
+UDP_SESSIONS = {}  # user -> [{"ip": str, "connected_at": float}, ...]
+UDP_SESSION_TTL = 180  # seconds
+
+_UDP_CONNECT_RE = re.compile(r"\[src:(?P<ip>[\d.]+):\d+\].*?\[user:(?P<user>\S+)\].*Client connected")
+_UDP_DISCONNECT_RE = re.compile(r"\[src:(?P<ip>[\d.]+):\d+\].*Client disconnected")
+
+
+def _udp_prune_expired(now):
+    for u in list(UDP_SESSIONS.keys()):
+        kept = [s for s in UDP_SESSIONS[u] if now - s["connected_at"] < UDP_SESSION_TTL]
+        if kept:
+            UDP_SESSIONS[u] = kept
+        else:
+            del UDP_SESSIONS[u]
+
+
+def udp_journal_watcher():
+    """Tails `journalctl -u udp-custom -f` forever and updates UDP_SESSIONS.
+    Runs in the background for the life of the panel process. If journalctl
+    exits (service restarted, journald hiccup) it just reconnects."""
+    while True:
+        try:
+            proc = subprocess.Popen(
+                ["journalctl", "-u", "udp-custom", "-f", "-n", "0", "--no-pager", "-o", "cat"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            )
+            for line in proc.stdout:
+                now = time.time()
+                m = _UDP_CONNECT_RE.search(line)
+                if m:
+                    with UDP_SESSIONS_LOCK:
+                        _udp_prune_expired(now)
+                        UDP_SESSIONS.setdefault(m.group("user"), []).append(
+                            {"ip": m.group("ip"), "connected_at": now}
+                        )
+                    continue
+                m = _UDP_DISCONNECT_RE.search(line)
+                if m:
+                    ip = m.group("ip")
+                    with UDP_SESSIONS_LOCK:
+                        _udp_prune_expired(now)
+                        oldest_user, oldest_idx, oldest_t = None, None, None
+                        for u, sessions in UDP_SESSIONS.items():
+                            for i, s in enumerate(sessions):
+                                if s["ip"] == ip and (oldest_t is None or s["connected_at"] < oldest_t):
+                                    oldest_user, oldest_idx, oldest_t = u, i, s["connected_at"]
+                        if oldest_user is not None:
+                            del UDP_SESSIONS[oldest_user][oldest_idx]
+                            if not UDP_SESSIONS[oldest_user]:
+                                del UDP_SESSIONS[oldest_user]
+        except Exception:
+            pass
+        time.sleep(3)
+
+
 # ---------------------------------------------------- auto-kick enforcer ----
 # Runs in the background for as long as the panel process is alive (the
 # systemd service keeps the panel running 24/7 with Restart=always).
@@ -844,6 +927,7 @@ if __name__ == "__main__":
     load_auth()
     backfill_traffic_rules()
     threading.Thread(target=auto_kick_enforcer, daemon=True).start()
+    threading.Thread(target=udp_journal_watcher, daemon=True).start()
     port = int(os.environ.get("PANEL_PORT", "2053"))
     app.run(host="0.0.0.0", port=port)
 APPEOF
